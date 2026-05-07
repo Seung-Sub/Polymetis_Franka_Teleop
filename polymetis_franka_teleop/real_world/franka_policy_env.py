@@ -145,6 +145,9 @@ class FrankaPolicyEnv:
             # speed limits
             max_pos_speed=2.0,
             max_rot_speed=6.0,
+            # Cartesian impedance gain scaling (UMI defaults Kx=[750,750,750,15,15,15], Kxd=[37,37,37,2,2,2])
+            Kx_scale=1.0,
+            Kxd_scale=1.0,
             # vis params
             enable_multi_cam_vis=True,
             multi_cam_vis_resolution=(960, 960),
@@ -267,6 +270,8 @@ class FrankaPolicyEnv:
             frequency=robot_frequency,
             tcp_offset=tcp_offset,
             use_wsg_gripper=False,
+            Kx_scale=Kx_scale,
+            Kxd_scale=Kxd_scale,
             joints_init=init_joints,
             verbose=verbose,
             receive_latency=robot_obs_latency,

@@ -131,6 +131,13 @@ class FrankaInterface:
                  tx_flange_tip_override=None):
         self.mode = mode
         self._cached_q = None
+        # Last joint target that successfully passed IK. We send this to
+        # polymetis whenever a fresh IK call fails so the NUC keeps receiving
+        # updates and its 1 s watchdog doesn't kill the impedance policy.
+        # Without this fallback, sending a Vive target outside the workspace
+        # for >1 s would cascade-kill the controller.
+        self._last_good_joint_target = None
+        self._ik_fail_streak = 0
         if mode == 'zerorpc':
             import zerorpc
             self._rpc = zerorpc.Client(heartbeat=20)
@@ -219,7 +226,21 @@ class FrankaInterface:
             q_current,
         )
         if not success:
+            # IK didn't converge — most often because the user pushed the Vive
+            # target outside the reachable workspace. Re-send the LAST good
+            # target so polymetis still receives a tick this iter; otherwise
+            # the NUC's 1 s watchdog will kill the impedance policy after
+            # ~100 consecutive failures and we get a recovery cascade.
+            self._ik_fail_streak += 1
+            if self._ik_fail_streak in (1, 50, 100):
+                print(f"[FrankaInterface] IK failed {self._ik_fail_streak}x "
+                      f"in a row — sending last good joint target to keep "
+                      f"polymetis watchdog alive.", flush=True)
+            if self._last_good_joint_target is not None:
+                self.robot.update_desired_joint_positions(self._last_good_joint_target)
             return
+        self._ik_fail_streak = 0
+        self._last_good_joint_target = joint_target
         self.robot.update_desired_joint_positions(joint_target)
 
     def set_cached_q(self, q):
@@ -498,12 +519,48 @@ class FrankaInterpolationController(mp.Process):
                 print(f"[FrankaPositionalController] TCP offset: {self.tcp_offset}m, WSG mode: {self.use_wsg_gripper}")
                 print(f"[FrankaPositionalController] Teleop mode: {self.teleop_mode}")
 
-            # init pose
+            # init pose. Polymetis silently no-ops move_to_joint_positions if
+            # ANOTHER controller is already running on the NUC (a leftover
+            # JointImpedance from a crashed demo, or one started by a parallel
+            # client). The fix used by Isaac-GR00T's franka_env_kist.reset()
+            # is to terminate any current policy first.
             if self.joints_init is not None:
-                robot.move_to_joint_positions(
-                    positions=np.asarray(self.joints_init),
-                    time_to_go=self.joints_init_duration
-                )
+                print(f"[FrankaPositionalController] joints_init={np.round(self.joints_init, 3).tolist()}"
+                      f" — terminating any stale controller, then move_to_joint_positions"
+                      f"(time_to_go={self.joints_init_duration}s)...", flush=True)
+                try:
+                    if robot.mode != 'zerorpc' and hasattr(robot, 'robot'):
+                        # 'direct' mode: robot.robot is the polymetis RobotInterface.
+                        try:
+                            robot.robot.terminate_current_policy()
+                            time.sleep(0.3)
+                        except Exception:
+                            pass  # no policy was running — fine
+                    q_before = robot.get_joint_positions()
+                    robot.move_to_joint_positions(
+                        positions=np.asarray(self.joints_init),
+                        time_to_go=self.joints_init_duration
+                    )
+                    q_after = robot.get_joint_positions()
+                    moved = float(np.linalg.norm(q_after - q_before))
+                    err_to_tgt = float(np.linalg.norm(q_after - np.asarray(self.joints_init)))
+                    print(f"[FrankaPositionalController] move_to_joint_positions returned. "
+                          f"q_after={np.round(q_after, 3).tolist()}  ‖Δq‖={moved:.3f}  "
+                          f"‖q_after-target‖={err_to_tgt:.3f}", flush=True)
+                    # Real silent no-op only if BOTH barely moved AND still far from target.
+                    # If err_to_tgt is small, the robot was already at home (e.g. previous
+                    # demo left it there) — that's success.
+                    if moved < 0.05 and err_to_tgt > 0.1:
+                        print(f"[FrankaPositionalController] WARNING: robot barely moved "
+                              f"AND not at target — polymetis may have silently no-op'd. "
+                              f"Check: 1) Franka Desk FCI active 2) no external clients "
+                              f"holding the impedance.", flush=True)
+                except Exception as e:
+                    print(f"[FrankaPositionalController] move_to_joint_positions FAILED: {e!r}",
+                          flush=True)
+            else:
+                print(f"[FrankaPositionalController] joints_init is None — skipping startup move",
+                      flush=True)
 
             # main loop
             dt = 1. / self.frequency
@@ -525,10 +582,22 @@ class FrankaInterpolationController(mp.Process):
                 Kx=self.Kx,
                 Kxd=self.Kxd
             )
+            # Stabilization wait — polymetis takes 200-400 ms typical to
+            # bring the new impedance policy fully online on the NUC RT
+            # thread. 1.0 s is conservative and matches the recovery path.
+            time.sleep(1.0)
 
             t_start = time.monotonic()
             iter_idx = 0
             keep_running = True
+
+            # Recovery throttling — polymetis can return "no controller
+            # running" briefly even during normal operation (watchdog races
+            # under transient CPU load). Each recovery is silent except for a
+            # summary every 30 s, plus the very first one.
+            recovery_count = 0
+            recovery_last_summary_t = time.monotonic()
+            recovery_just_fired = False  # set True on the iter that recovers
 
             # Teleop mode state
             teleop_target_pose = curr_pose.copy()
@@ -648,8 +717,18 @@ class FrankaInterpolationController(mp.Process):
                         'joint_position_limits',
                         'torque_discontinuity'
                     ]):
-                        print(f"\n[FrankaPositionalController] Controller error detected: {e}")
-                        print("[FrankaPositionalController] Attempting automatic recovery...")
+                        recovery_count += 1
+                        # Print full detail on first error so we can identify
+                        # the trigger; subsequent ones print a one-liner so
+                        # the user can see them happening (was previously
+                        # silent and masked the true frequency).
+                        if recovery_count == 1:
+                            print(f"\n[FrankaPositionalController] Controller error: {e}")
+                            print(f"[FrankaPositionalController] Attempting automatic recovery (count=1)...")
+                        else:
+                            short_err = str(e).split('\n')[0][:80]
+                            print(f"[FrankaPositionalController] Recovery #{recovery_count}: {short_err}",
+                                  flush=True)
                         try:
                             # Terminate any crashed policy
                             try:
@@ -662,12 +741,16 @@ class FrankaInterpolationController(mp.Process):
                             curr_pose = robot.get_ee_pose()
                             teleop_target_pose = curr_pose.copy()
 
-                            # Restart impedance controller
+                            # Restart impedance controller. Sleep 1.0 s before
+                            # the loop's next update_desired_ee_pose call —
+                            # polymetis takes 200-400 ms typical but can be
+                            # 800+ ms under load; 0.5 s used to cascade into
+                            # repeat recoveries. 1.0 s is conservative.
                             robot.start_cartesian_impedance(
                                 Kx=self.Kx,
                                 Kxd=self.Kxd
                             )
-                            time.sleep(0.05)
+                            time.sleep(1.0)
 
                             # Update interpolator with fresh pose
                             pose_interp = PoseTrajectoryInterpolator(
@@ -675,15 +758,50 @@ class FrankaInterpolationController(mp.Process):
                                 poses=[curr_pose]
                             )
 
-                            # In teleop mode, require clutch re-engage before accepting targets
-                            # This prevents jumping to stale target values
+                            # Decide whether the user must release-and-re-press
+                            # Grip after recovery. For "no controller running"
+                            # (polymetis watchdog race) the robot stayed at its
+                            # commanded pose and the offset between Vive and
+                            # robot is unchanged — we can re-sync the offset
+                            # in-place and keep teleop fluent. For reflex/limit
+                            # violations the robot decelerated to an unknown
+                            # pose, so we force grip release for safety.
+                            is_watchdog_only = ('no controller running' in error_str
+                                                and not any(x in error_str for x in (
+                                                    'reflex', 'velocity_violation',
+                                                    'joint_position_limits',
+                                                    'torque_discontinuity')))
                             if self.teleop_mode:
-                                wait_for_clutch_engage = True  # Wait for clutch 0->1 transition
-                                prev_clutch_active = False  # Reset clutch state
-                                teleop_target_pose = curr_pose.copy()  # Use current pose
-                                clutch_pose_offset = None  # Reset offset
+                                if is_watchdog_only:
+                                    # Recompute clutch offset against fresh pose
+                                    # so the next teleop target lands at curr_pose.
+                                    teleop_target_pose = curr_pose.copy()
+                                    if clutch_pose_offset is not None:
+                                        try:
+                                            ts_now = self.teleop_ring_buffer.get()
+                                            teleop_target_raw = ts_now['target_pose']
+                                            clutch_pose_offset = curr_pose - teleop_target_raw
+                                        except Exception:
+                                            pass
+                                    # Don't force wait_for_clutch_engage — keep teleop alive.
+                                else:
+                                    wait_for_clutch_engage = True
+                                    prev_clutch_active = False
+                                    teleop_target_pose = curr_pose.copy()
+                                    clutch_pose_offset = None
 
-                            print("[FrankaPositionalController] Recovery successful! Impedance restarted. (Waiting for clutch engage)")
+                            recovery_just_fired = True
+                            if recovery_count == 1:
+                                print("[FrankaPositionalController] Recovery successful! "
+                                      "Impedance restarted.")
+                            # Rate summary every 30 s if recoveries keep firing
+                            now_t = time.monotonic()
+                            if now_t - recovery_last_summary_t >= 30.0:
+                                rate = recovery_count / max(1.0, now_t - t_start)
+                                print(f"[FrankaPositionalController] cumulative {recovery_count} "
+                                      f"recoveries ({rate:.3f}/s avg) — investigate if rate>0.05/s "
+                                      f"persists.", flush=True)
+                                recovery_last_summary_t = now_t
                         except Exception as recovery_error:
                             print(f"[FrankaPositionalController] Recovery failed: {recovery_error}")
                             # Continue running, will retry next iteration
@@ -717,6 +835,18 @@ class FrankaInterpolationController(mp.Process):
                 state['robot_receive_timestamp'] = t_recv
                 state['robot_timestamp'] = t_recv - self.receive_latency
                 self.ring_buffer.put(state)
+
+                # Feed the joint state we just read into FrankaInterface as the
+                # IK seed for the upcoming update_desired_ee_pose. Without this
+                # cache, ``update_desired_ee_pose`` falls back to making its
+                # own get_joint_positions() gRPC every iter — at 100 Hz that's
+                # 100 extra round-trips/s to the NUC, doubling polymetis load
+                # and contributing to the "no controller running" watchdog
+                # races we saw recover every ~10 s.
+                try:
+                    robot.set_cached_q(state['ActualQ'])
+                except Exception:
+                    pass
 
                 # fetch command from queue (works in both modes)
                 try:
@@ -771,6 +901,10 @@ class FrankaInterpolationController(mp.Process):
                     elif cmd == Command.MOVE_HOME.value:
                         # Move to home position
                         home_duration = float(command['duration'])
+                        # Tag this iter so the slow-iter WARN doesn't fire — a
+                        # MOVE_HOME iter legitimately takes 2 s motion + 0.5 s
+                        # stabilize ≈ 3 s and is not a watchdog risk.
+                        recovery_just_fired = True
                         print(f"\n[FrankaPositionalController] Moving to HOME position ({home_duration}s)...")
 
                         try:
@@ -830,6 +964,25 @@ class FrankaInterpolationController(mp.Process):
                     else:
                         keep_running = False
                         break
+
+                # Detect iters that take > 100 ms (= 10x normal). 100Hz iters
+                # should be ~10 ms each. Anything > 100 ms is a stall worth
+                # investigating; >1 s trips the polymetis watchdog. We
+                # exclude recovery iters (which inherently sleep ~600 ms) by
+                # comparing the previous-iter end timestamp.
+                t_iter_end = time.monotonic()
+                iter_duration = t_iter_end - t_now
+                # Recovery iters legitimately spend 600+ ms in start_impedance
+                # + sleep; quietly skip warning during the same iter as the
+                # recovery code ran.
+                # Suppress WARN when this iter ran a recovery or MOVE_HOME
+                # (both legitimately sleep > 100 ms and aren't watchdog risks).
+                # recovery_just_fired = True is set in BOTH cases.
+                if iter_duration > 0.1 and not recovery_just_fired:
+                    print(f"[FrankaPositionalController] WARN slow iter "
+                          f"#{iter_idx}: {iter_duration*1000:.0f} ms "
+                          f"(watchdog limit 1000 ms)", flush=True)
+                recovery_just_fired = False
 
                 # regulate frequency
                 t_wait_util = t_start + (iter_idx + 1) * dt

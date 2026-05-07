@@ -33,6 +33,45 @@ Usage:
 from typing import Optional
 import pathlib
 import numpy as np
+
+
+# === Ready-pose presets ===
+# 6-joint base (joints 1..6); joint 7 (gripper yaw) is appended per-gripper.
+#
+# DROID base — matches the GR00T DROID training data state distribution.
+# The pose is slightly tilted forward (-π/5 vs -π/4) so the wrist camera sees
+# the table workspace by default.
+_READY_BASE_DROID  = [0.0, -np.pi / 5, 0.0, -4 * np.pi / 5, 0.0, 3 * np.pi / 5]
+# Standard Franka home — the panda factory default.
+_READY_BASE_FRANKA = [0.0, -np.pi / 4, 0.0, -3 * np.pi / 4, 0.0,     np.pi / 2]
+
+
+def compute_ready_pose(data_format: str, gripper_backend: str) -> np.ndarray:
+    """Pick the joint-7 (gripper yaw) value and base 6-joint pose from the
+    data format + gripper combination.
+
+    | data_format        | gripper | joints 1..6     | joint 7 |
+    |--------------------|---------|-----------------|---------|
+    | groot (DROID)      | art     | DROID tilt      | 0       |
+    | groot (DROID)      | franka  | DROID tilt      | π/4     |
+    | umi / diffusion    | art     | Franka home     | 0       |  ← yaw matches GR00T
+    | umi / diffusion    | franka  | Franka home     | π/4     |  ← stock Franka pose
+
+    GR00T uses joint-7=0 with the DROID-tilted base because its training data
+    was collected that way; switching base poses would put state observations
+    out of distribution for the policy.
+    """
+    df = data_format.lower()
+    gb = gripper_backend.lower()
+    if df == 'groot':
+        base = _READY_BASE_DROID
+    elif df in ('umi', 'diffusion'):
+        base = _READY_BASE_FRANKA
+    else:
+        raise ValueError(
+            f"Unknown data_format={data_format!r} (use 'groot', 'umi', or 'diffusion')")
+    j7 = 0.0 if gb == 'art' else np.pi / 4
+    return np.array(list(base) + [j7], dtype=np.float64)
 import time
 import shutil
 import math
@@ -109,7 +148,13 @@ class FrankaViveEnv:
                                        # because NUC realtime thread can't keep up under combined gRPC+IK load).
                                        # UMI uses 200 Hz on a faster RT NUC — bump if your NUC supports it.
             tcp_offset=None,
-            init_joints=None,
+            init_joints=None,             # explicit ready-pose override; None → compute from data_format
+            # data_format determines the ready (home) joint pose:
+            #   'groot'  → DROID-tilted base, matches nvidia/GR00T-N1.7-DROID training data
+            #   'umi' / 'diffusion' → standard Franka home
+            # joint-7 (gripper yaw) is set by gripper_backend regardless.
+            data_format='groot',
+            auto_home_on_start=True,      # auto-move to ready pose when controller boots
             # backend selection (KIST extension)
             camera_backend='zed',          # 'zed' or 'realsense'
             gripper_backend='art',         # 'art' (Hyundai) or 'franka' (Franka Hand)
@@ -127,8 +172,14 @@ class FrankaViveEnv:
             use_velocity_clamping=False,  # Disable by default for 1:1 mapping
             max_pos_velocity=2.0,  # m/s - Franka max cartesian velocity is ~1.7m/s
             max_rot_velocity=2.5,  # rad/s - Franka max angular velocity
+            # Cartesian impedance gain scaling — multiplied onto the UMI defaults
+            # Kx=[750,750,750, 15,15,15], Kxd=[37,37,37, 2,2,2]. >1 = stiffer/snappier
+            # tracking but more chance of overshoot/reflex; <1 = softer.
+            Kx_scale=1.0,
+            Kxd_scale=1.0,
             gripper_open_width=0.075,  # Match actual Franka Hand observation max (was 0.08)
-            gripper_close_width=0.005,  # 5mm - avoid 0.0 which causes libfranka exception
+            gripper_close_width=None,  # auto: 0.0 for ART (full close), 0.005 for Franka Hand
+            grip_force=None,           # auto: 60N for ART (firm grip on thin objects), 30N Franka
             # vis params
             enable_multi_cam_vis=True,
             multi_cam_vis_resolution=(960, 960),
@@ -145,6 +196,38 @@ class FrankaViveEnv:
             # ART width envelope is wider than Franka Hand's
             if gripper_open_width <= 0.075 + 1e-9:
                 gripper_open_width = 0.095
+            # Full mechanical close — ART firmware accepts 0mm. Lets us pinch
+            # thin objects (paper, cards) that won't trigger contact at 5mm.
+            if gripper_close_width is None:
+                gripper_close_width = 0.0
+            # Stronger default grip than Franka Hand — enough to hold smooth
+            # objects without slipping, well below the 100N firmware cap.
+            if grip_force is None:
+                grip_force = 60.0
+        else:  # franka hand
+            # Franka libfranka throws if width=0.0 — leave a 5mm safety margin
+            if gripper_close_width is None:
+                gripper_close_width = 0.005
+            if grip_force is None:
+                grip_force = 30.0
+
+        # Resolve ready pose from data_format + gripper_backend if not explicitly given.
+        # ``ready_pose`` is the canonical home for both trackpad-HOME and (when
+        # auto_home_on_start) the controller's startup move-to.
+        if init_joints is None:
+            ready_pose = compute_ready_pose(data_format, gripper_backend)
+        else:
+            ready_pose = np.asarray(init_joints, dtype=np.float64)
+        if verbose:
+            print(f"[FrankaViveEnv] data_format={data_format} gripper={gripper_backend} "
+                  f"auto_home_on_start={auto_home_on_start} "
+                  f"→ ready pose (rad): {np.round(ready_pose, 3).tolist()}")
+        self.data_format = data_format
+        self.ready_pose = ready_pose
+        # joints_init: triggers a single move at controller boot. None = skip.
+        # home_joints: where MOVE_HOME (trackpad / 'h' key) goes during teleop;
+        #              always set so HOME keeps working even with --no_auto_home.
+        controller_joints_init = ready_pose if auto_home_on_start else None
 
         output_dir = pathlib.Path(output_dir)
         assert output_dir.parent.is_dir()
@@ -200,14 +283,22 @@ class FrankaViveEnv:
                 float32=False
             ))
 
-            # Video recorder
+            # Video recorder.
+            # buffer_size=512 gives ~8.5 s of grace at 60 fps before queue.Full
+            # crashes the SingleZed worker when the encoder briefly stalls
+            # (disk write hiccup, GIL contention, etc.). Default 128 = 2.1 s,
+            # which we observed empty out under recording load.
+            # thread_count=4 lets one camera's H.264 encoder use multiple cores
+            # — single-thread libx264 at HD720@60 is borderline on this CPU
+            # and can't drain the queue at line rate when both cameras record.
             video_recorder.append(VideoRecorder.create_h264(
                 fps=camera_fps,
                 codec='h264',
                 input_pix_fmt='bgr24',
                 crf=18,
                 thread_type='FRAME',
-                thread_count=1
+                thread_count=4,
+                buffer_size=512,
             ))
 
         if camera_backend == 'zed':
@@ -276,6 +367,12 @@ class FrankaViveEnv:
         )
 
         # === Setup Robot Controller (teleop mode) ===
+        # joints_init: one-shot move-to at controller boot (before impedance
+        #              starts). None = skip; user passed --no_auto_home.
+        # home_joints: target for MOVE_HOME (trackpad / 'h' key). Always set
+        #              so HOME keeps working.
+        # joints_init_duration matches GR00T DROID's reset move (4 s) — fast
+        # enough for routine startup, slow enough not to startle anyone.
         robot = FrankaInterpolationController(
             shm_manager=shm_manager,
             robot_ip=robot_ip,
@@ -284,7 +381,12 @@ class FrankaViveEnv:
             frequency=robot_frequency,
             tcp_offset=tcp_offset,
             use_wsg_gripper=False,
-            joints_init=init_joints,
+            Kx_scale=Kx_scale,
+            Kxd_scale=Kxd_scale,
+            joints_init=controller_joints_init,
+            joints_init_duration=4.0,
+            home_joints=ready_pose,
+            home_time=2.0,
             verbose=verbose,
             receive_latency=robot_obs_latency,
             teleop_mode=True,
@@ -304,6 +406,7 @@ class FrankaViveEnv:
                 teleop_ring_buffer=teleop.gripper_ring_buffer,
                 gripper_open_width=gripper_open_width,
                 gripper_close_width=gripper_close_width,
+                default_force=grip_force,
             )
         elif gripper_backend == 'franka':
             gripper = FrankaGripperController(
@@ -738,28 +841,39 @@ class FrankaViveEnv:
 
     def move_home(self, wait=False):
         """
-        Move robot to home position.
-        This will:
-        1. Stop impedance control
-        2. Move to home joint positions
-        3. Restart impedance control
-        4. Reset teleop clutch reference
+        Reset to ready pose: open gripper + move robot to home joints.
 
-        Safe to call during teleop operation.
+        Mirrors Isaac-GR00T's franka_env_kist.reset() — gripper opens
+        BEFORE the arm moves so anything currently held is released, and
+        the robot starts from a known fully-open state.
+
+        Sequence:
+        1. Open gripper (non-blocking — happens in parallel with arm move)
+        2. Robot controller MOVE_HOME (terminates impedance, moves joints,
+           restarts impedance, requires clutch re-engage)
+        3. Optional wait for arm motion to complete
 
         Args:
             wait: If True, block until home motion completes (default: False)
         """
-        print("[FrankaViveEnv] Moving to HOME position...")
+        print("[FrankaViveEnv] Moving to HOME position (gripper open + arm to ready pose)...")
 
-        # Send home command to robot controller
+        # 1. Open gripper. The ArtGripperController polls input_queue in both
+        # teleop and normal modes, so this works during active teleop too.
+        try:
+            open_w = float(self.gripper.gripper_open_width)
+            self.gripper.goto(width=open_w)
+        except Exception as e:
+            print(f"[FrankaViveEnv] gripper open failed (continuing arm move): {e}")
+
+        # 2. Send home command to robot controller (asynchronous)
         self.robot.move_home()
 
         if wait:
-            # Wait for home motion to complete (approximate)
-            # The actual duration is set in FrankaInterpolationController
+            # Wait for arm motion to complete (approximate — arm move time
+            # is set in FrankaInterpolationController.home_time = 2.0s).
             import time
-            time.sleep(2.5)  # home_time (2.0s) + buffer
+            time.sleep(2.5)
             print("[FrankaViveEnv] HOME complete. Re-engage clutch (grip) to continue teleop.")
 
     # ========= Recording API =============

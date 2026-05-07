@@ -515,7 +515,7 @@ class ViveTeleopProcess(mp.Process):
                         prev_target_rot = None
 
                         # CRITICAL: Require grip release before clutch can be activated
-                        # This ensures FrankaInterpolationController sees proper 0→1 transition
+                        # This ensures FrankaInterpolationController sees proper 0->1 transition
                         require_grip_release = True
 
                         # Reset rotation state after HOME (robot position changed)
@@ -523,12 +523,25 @@ class ViveTeleopProcess(mp.Process):
                         base_position = None
                         accumulated_z_rotation = 0.0
 
+                        # Reset GRIPPER toggle state to OPEN to match the
+                        # physical state. env.move_home() opens the gripper as
+                        # part of HOME, but ViveTeleopProcess's gripper_closed
+                        # latch was retaining its pre-HOME value, causing the
+                        # next trigger press to fall on the wrong half of the
+                        # toggle (had to press TWICE to actually close).
+                        gripper_closed = False
+                        gripper_state = 0.0
+                        gripper_command = GripperCommand.NONE
+                        awaiting_trigger_release = True   # ignore stale trigger state
+                        gripper_target_width = self.gripper_open_width
+
                         # Sync target_pose to current robot pose
                         if current_robot_pose is not None:
                             target_pose = current_robot_pose.copy()
 
                         if self.verbose:
-                            print(f"[ViveTeleopProcess] HOME mode ended (synced to: [{target_pose[0]:.3f}, {target_pose[1]:.3f}, {target_pose[2]:.3f}]) - Release grip to continue")
+                            print(f"[ViveTeleopProcess] HOME mode ended (synced to: [{target_pose[0]:.3f}, {target_pose[1]:.3f}, {target_pose[2]:.3f}], "
+                                  f"gripper reset to OPEN) - Release grip to continue")
 
                     # Skip ALL clutch processing during HOME mode
                     # (prevents Vive movement from affecting target_pose)

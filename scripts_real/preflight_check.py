@@ -19,6 +19,37 @@ import sys
 import time
 import os
 import signal
+import glob
+
+
+def _run_sudo(cmd_list, input_text: str = '', timeout: float = 30.0):
+    """Run a command with elevated privileges. Tries:
+    1. ``sudo -n`` (NOPASSWD) — silent, fast.
+    2. ``sudo -S`` with $POLYMETIS_SUDO_PASSWORD — for unattended ops.
+    Returns (returncode, stdout, stderr). rc=126 means we couldn't elevate.
+    """
+    # 1. passwordless sudo
+    try:
+        p = subprocess.run(['sudo', '-n'] + cmd_list,
+                           input=input_text, capture_output=True,
+                           text=True, timeout=timeout)
+        if p.returncode == 0:
+            return 0, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, '', 'sudo -n timed out'
+    except FileNotFoundError:
+        return 127, '', 'sudo not installed'
+    # 2. password via env var
+    pwd = os.environ.get('POLYMETIS_SUDO_PASSWORD')
+    if pwd:
+        try:
+            p = subprocess.run(['sudo', '-S', '-p', ''] + cmd_list,
+                               input=pwd + '\n' + input_text,
+                               capture_output=True, text=True, timeout=timeout)
+            return p.returncode, p.stdout, p.stderr
+        except subprocess.TimeoutExpired:
+            return 124, '', 'sudo -S timed out'
+    return 126, '', 'sudo unavailable (no NOPASSWD, no $POLYMETIS_SUDO_PASSWORD)'
 
 # Colors for terminal output
 class Colors:
@@ -132,26 +163,99 @@ def check_and_kill_orphan_multiprocessing():
     return True
 
 
-def check_zed_cameras():
-    """Check if ZED cameras are available (KIST default)."""
-    print(f"\n{Colors.BOLD}[3/5] Checking ZED cameras...{Colors.RESET}")
+def _release_zed_video_handles():
+    """Find any process holding /dev/video* (ZED v4l2 nodes) and kill it.
+    Returns the number of holders killed.
+
+    A previous demo crash leaves the camera-process child of multiprocessing
+    spawn alive and still attached to the v4l2 device. lsusb still shows the
+    camera, but ZED SDK's ``Camera.get_device_list()`` returns it as missing
+    until the file descriptor is released.
+    """
+    killed = 0
+    try:
+        out = subprocess.check_output(['lsof', '-t', '-w'] + glob.glob('/dev/video*'),
+                                      text=True, stderr=subprocess.DEVNULL)
+        pids = sorted({int(p) for p in out.split() if p.strip().isdigit()})
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pids = []
+    self_pid = os.getpid()
+    for pid in pids:
+        if pid == self_pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    if killed:
+        time.sleep(1.5)  # let kernel release fds
+    return killed
+
+
+def _zed_usb_authorize_cycle():
+    """Toggle USB ``authorized`` for every Stereolabs (vid 2b03) device, then
+    re-enable. This kicks the ZED firmware back into a state where the SDK
+    can probe it. Requires sudo. Returns True if at least one device was
+    cycled."""
+    script = (
+        "for d in /sys/bus/usb/devices/*/; do "
+        "  [ \"$(cat \"$d/idVendor\" 2>/dev/null)\" = \"2b03\" ] || continue; "
+        "  echo 0 > \"$d/authorized\" 2>/dev/null; "
+        "  sleep 1; "
+        "  echo 1 > \"$d/authorized\" 2>/dev/null; "
+        "  basename \"$d\"; "
+        "done"
+    )
+    rc, out, _err = _run_sudo(['bash', '-c', script], timeout=20)
+    return rc == 0 and bool(out.strip())
+
+
+def check_zed_cameras(expected: int = 2):
+    """ZED detection with two-stage auto-recovery: kill stale holders, then
+    USB authorize cycle if SDK still can't see the expected count."""
+    print(f"\n{Colors.BOLD}[3/5] Checking ZED cameras (expected {expected})...{Colors.RESET}")
     try:
         import pyzed.sl as sl
-        devs = sl.Camera.get_device_list()
-        if not devs:
-            print_status("No ZED cameras detected!", 'error')
-            return False
-        print_status(f"Found {len(devs)} ZED camera(s):", 'ok')
-        for d in devs:
-            print_status(f"  sn={d.serial_number} {d.camera_model} ({d.camera_state})", 'info')
-        avail = [d for d in devs if d.camera_state == sl.CAMERA_STATE.AVAILABLE]
-        if not avail:
-            print_status("All ZED devices are unavailable (in use elsewhere?)", 'warn')
-            return False
-        return True
     except ImportError:
-        print_status("pyzed.sl not installed in this env — skip if using --camera_backend realsense", 'warn')
+        print_status("pyzed.sl not installed — skip if using --camera_backend realsense", 'warn')
         return True
+
+    devs = sl.Camera.get_device_list()
+    if len(devs) < expected:
+        # First: kill any process still holding /dev/video* (orphan from a
+        # crashed demo).
+        killed = _release_zed_video_handles()
+        if killed:
+            print_status(f"Killed {killed} stale process(es) holding /dev/video*", 'fix')
+        time.sleep(1.0)
+        devs = sl.Camera.get_device_list()
+        # Second: if still short, USB authorize toggle (sudo) to unstick a
+        # frozen firmware.
+        if len(devs) < expected:
+            print_status(f"Only {len(devs)} ZED detected — USB authorize cycle...", 'fix')
+            if _zed_usb_authorize_cycle():
+                time.sleep(8)  # ZED firmware re-init takes 5–8s
+                devs = sl.Camera.get_device_list()
+            else:
+                print_status("USB authorize cycle skipped (need sudo or "
+                             "$POLYMETIS_SUDO_PASSWORD)", 'warn')
+
+    if not devs:
+        print_status("No ZED cameras detected!", 'error')
+        return False
+    print_status(f"Found {len(devs)} ZED camera(s):", 'ok' if len(devs) >= expected else 'warn')
+    for d in devs:
+        print_status(f"  sn={d.serial_number} {d.camera_model} ({d.camera_state})", 'info')
+    avail = [d for d in devs if d.camera_state == sl.CAMERA_STATE.AVAILABLE]
+    if not avail:
+        print_status("All ZED devices are unavailable (in use elsewhere?)", 'warn')
+        return False
+    if len(devs) < expected:
+        print_status(f"Got {len(devs)}/{expected} expected — one camera may "
+                     f"need to be physically replugged", 'warn')
+        return False
+    return True
 
 
 def check_realsense_cameras():
@@ -176,30 +280,67 @@ def check_realsense_cameras():
         return True
 
 
-def check_vive_server():
-    """Check if the ROS-free Vive input TCP server is up."""
-    print(f"\n{Colors.BOLD}[4/5] Checking Vive input server...{Colors.RESET}")
+def _is_listening(host: str, port: int, timeout: float = 1.5) -> bool:
     import socket
-    host, port = '127.0.0.1', 12345
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(2)
-        ok = sock.connect_ex((host, port)) == 0
-        sock.close()
-        if ok:
-            print_status(f"Vive input listening at {host}:{port}", 'ok')
-        else:
-            print_status(f"Vive input NOT listening at {host}:{port}", 'warn')
-            print_status("Start with: bash bin/start_vive_input.sh   (ROS-free)", 'info')
-            print_status("(Make sure SteamVR GUI is open first.)", 'info')
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        ok = s.connect_ex((host, port)) == 0
+        s.close()
+        return ok
+    except Exception:
+        return False
+
+
+def _pgrep(pattern: str) -> bool:
+    try:
+        return subprocess.call(['pgrep', '-f', pattern],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) == 0
+    except FileNotFoundError:
+        return False
+
+
+def check_vive_server():
+    """Vive input TCP server + SteamVR vrserver. Auto-starts both via
+    ``bin/start_vive_stack.sh start`` if either is missing."""
+    print(f"\n{Colors.BOLD}[4/5] Checking Vive input server...{Colors.RESET}")
+    host, port = '127.0.0.1', 12345
+    listening = _is_listening(host, port)
+    vrserver = _pgrep('vrserver')
+    if listening and vrserver:
+        print_status(f"Vive input listening at {host}:{port} (vrserver alive)", 'ok')
         return True
-    except Exception as e:
-        print_status(f"Error checking Vive: {e}", 'warn')
+
+    print_status(f"Vive stack incomplete (listening={listening} vrserver={vrserver}) "
+                 f"— attempting auto-start...", 'fix')
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    starter = os.path.join(repo_root, 'bin', 'start_vive_stack.sh')
+    if not os.path.isfile(starter):
+        print_status(f"Auto-start script not found at {starter}", 'warn')
+        print_status("Manual: bash bin/start_vive_stack.sh start", 'info')
         return True
+    try:
+        subprocess.run(['bash', starter, 'start'],
+                       check=False, timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        print_status("start_vive_stack.sh timed out (vrserver may need GUI/headset)", 'warn')
+    # vrserver takes ~5s to come up
+    for _ in range(15):
+        if _is_listening(host, port) and _pgrep('vrserver'):
+            print_status(f"Vive stack started ({host}:{port})", 'ok')
+            return True
+        time.sleep(1)
+    print_status(f"Vive stack failed to start within 15s — controller unusable until fixed", 'warn')
+    print_status("Check: ssh into pro4000 + bash bin/start_vive_stack.sh status", 'info')
+    return True
 
 
 def check_robot_connection(robot_ip: str = '192.168.1.12', robot_port: int = 50051):
-    """Check polymetis arm gRPC reachability (no ZeroRPC indirection)."""
+    """Check polymetis arm: TCP reachable + can start/terminate a controller.
+    The full round-trip catches stale-controller / watchdog states that pass
+    a simple port-open test."""
     print(f"\n{Colors.BOLD}[5/5] Checking polymetis arm at {robot_ip}:{robot_port}...{Colors.RESET}")
     import socket
     try:
@@ -207,37 +348,139 @@ def check_robot_connection(robot_ip: str = '192.168.1.12', robot_port: int = 500
         sock.settimeout(3)
         ok = sock.connect_ex((robot_ip, robot_port)) == 0
         sock.close()
-        if ok:
-            print_status(f"Polymetis arm reachable at {robot_ip}:{robot_port}", 'ok')
-            return True
+    except Exception as e:
+        print_status(f"Error checking polymetis arm: {e}", 'error')
+        return False
+    if not ok:
         print_status(f"Polymetis arm not reachable at {robot_ip}:{robot_port}", 'error')
         print_status("On NUC: sudo bash /usr/local/sbin/start_franka_arm.sh", 'info')
         print_status("Also: Franka Desk → Activate FCI", 'info')
         return False
+
+    # Live test: read-only joint+ee pose RPCs. Avoids leaving any controller
+    # state on the NUC. The FrankaInterpolationController itself has watchdog
+    # recovery for the start_cartesian_impedance race.
+    try:
+        from polymetis import RobotInterface
+        robot = RobotInterface(ip_address=robot_ip, port=robot_port,
+                               enforce_version=False)
+        q = robot.get_joint_positions().numpy()
+        ee_pos, ee_quat = robot.get_ee_pose()
+        ee_pos = ee_pos.numpy()
+        print_status(f"Polymetis arm healthy "
+                     f"(q[0]={q[0]:.2f}, ee_xyz=[{ee_pos[0]:.2f},{ee_pos[1]:.2f},{ee_pos[2]:.2f}])", 'ok')
+        return True
+    except ImportError:
+        # polymetis client not in this env (zerorpc-only flow). TCP-reachable
+        # is the best we can do.
+        print_status(f"Polymetis arm reachable; client not importable here "
+                     f"(ok for --polymetis_mode zerorpc)", 'ok')
+        return True
     except Exception as e:
-        print_status(f"Error checking polymetis arm: {e}", 'error')
+        print_status(f"Polymetis read probe failed: {type(e).__name__}: {e}", 'error')
+        print_status("On NUC: sudo systemctl restart polymetis-server "
+                     "(or: sudo bash /usr/local/sbin/start_franka_arm.sh)", 'info')
         return False
 
 
+def _art_is_ready(host: str, port: int):
+    """Probe ART gripper firmware-ready state. Returns (reachable, healthy,
+    state_str). reachable=False on connection error; healthy means
+    is_ready=True AND is_fault=False — both required for goto/grasp to work.
+
+    A previous demo crash can leave the firmware with GS_READY=0 (commands
+    silently dropped) OR GS_FAULT=1 (motor disabled until reset). Either way
+    we run restart_gripper.sh."""
+    try:
+        from art_gripper_client import ArtGripperInterface
+    except ImportError:
+        # try pypath fallback that demo wrappers also use
+        for cand in (os.environ.get('ART_GRIPPER_PYPATH'),
+                     os.path.expanduser('~/Hyundai_motors_Gripper/python')):
+            if cand and os.path.isdir(cand) and cand not in sys.path:
+                sys.path.insert(0, cand)
+        try:
+            from art_gripper_client import ArtGripperInterface
+        except ImportError:
+            return None, False, 'art_gripper_client unavailable'
+    try:
+        g = ArtGripperInterface(ip_address=host, port=port, auto_motor_on=False)
+        s = g.get_state()
+        healthy = bool(s.is_ready) and not bool(s.is_fault)
+        return True, healthy, \
+               f"width={s.width:.3f} ready={s.is_ready} grasped={s.is_grasped} fault={s.is_fault}"
+    except Exception as e:
+        return False, False, repr(e)
+
+
+def _art_run_recovery():
+    """Run the documented EtherCAT/daemon restart on pro4000. Needs sudo."""
+    script = os.path.expanduser('~/Hyundai_motors_Gripper/scripts/restart_gripper.sh')
+    if not os.path.isfile(script):
+        return False, f'recovery script missing: {script}'
+    rc, _out, err = _run_sudo(['bash', script], timeout=30)
+    return rc == 0, err.strip() or 'unknown'
+
+
 def check_art_gripper_daemon(host: str = '127.0.0.1', port: int = 50053):
-    """Check ART gripper TCP daemon (KIST extension)."""
+    """ART daemon health: TCP reachability + firmware GS_READY. Auto-runs
+    ``restart_gripper.sh`` (sudo) if the firmware is stuck."""
     print(f"\n{Colors.BOLD}[+] Checking ART gripper daemon at {host}:{port}...{Colors.RESET}")
     import socket
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(2)
-        ok = sock.connect_ex((host, port)) == 0
+        reachable = sock.connect_ex((host, port)) == 0
         sock.close()
-        if ok:
-            print_status(f"ART gripper daemon reachable at {host}:{port}", 'ok')
-        else:
-            print_status(f"ART gripper daemon not reachable at {host}:{port}", 'warn')
-            print_status("On pro4000: systemctl status art-gripper-daemon", 'info')
-            print_status("Or recover: sudo bash ~/Hyundai_motors_Gripper/scripts/restart_gripper.sh", 'info')
-        return True
     except Exception as e:
         print_status(f"Error checking ART daemon: {e}", 'warn')
+        return True  # non-fatal — user might be on Franka Hand backend
+    if not reachable:
+        print_status(f"ART daemon not reachable at {host}:{port}", 'warn')
+        print_status("Start with: systemctl start art-gripper-daemon", 'info')
         return True
+
+    # Drain stale CLOSE-WAIT TCP sessions on :50053 — leaked from previously-
+    # crashed demos. Counted via ss; daemon is single-threaded and slow new
+    # clients respond to PING when too many half-open sockets pile up.
+    try:
+        ssout = subprocess.check_output(
+            ['ss', '-tn', f'sport = :{port}'],
+            text=True, stderr=subprocess.DEVNULL)
+        stale = sum(1 for ln in ssout.splitlines() if 'CLOSE-WAIT' in ln)
+        if stale >= 2:
+            print_status(f"Detected {stale} stale CLOSE-WAIT TCP sessions on "
+                         f":{port} — restarting daemon to clear", 'fix')
+            _run_sudo(['systemctl', 'restart', 'art-gripper-daemon'], timeout=15)
+            time.sleep(3)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    ok, healthy, state = _art_is_ready(host, port)
+    if ok and healthy:
+        print_status(f"ART daemon ready ({state})", 'ok')
+        return True
+    if ok and not healthy:
+        # Could be is_ready=False, is_fault=True, or both. restart_gripper.sh
+        # does a kernel-level EtherCAT module reload + daemon restart that
+        # clears all firmware state.
+        print_status(f"ART firmware unhealthy ({state})", 'warn')
+        print_status("Running restart_gripper.sh (sudo) to reset firmware...", 'fix')
+        recovered, err = _art_run_recovery()
+        if not recovered:
+            print_status(f"Recovery failed: {err}", 'warn')
+            print_status("Manual: sudo bash ~/Hyundai_motors_Gripper/scripts/restart_gripper.sh", 'info')
+            return True
+        time.sleep(3)
+        ok2, healthy2, state2 = _art_is_ready(host, port)
+        if healthy2:
+            print_status(f"Recovery successful ({state2})", 'ok')
+        else:
+            print_status(f"Still unhealthy after recovery ({state2})", 'warn')
+            print_status("Try power-cycling the gripper 24V rail.", 'info')
+        return True
+    print_status(f"ART daemon probe error: {state}", 'warn')
+    return True
 
 
 def check_camera_640x480_60fps_support(serial_numbers=None):
@@ -278,13 +521,15 @@ def check_camera_640x480_60fps_support(serial_numbers=None):
         return True
 
 
-def run_preflight_check(check_robot=True, check_vive=True):
+def run_preflight_check(check_robot=True, check_vive=True, expected_cameras=2):
     """
     Run all pre-flight checks.
 
     Args:
-        check_robot: Whether to check robot connection
-        check_vive: Whether to check Vive server
+        check_robot: Whether to check robot connection (live test, not just port)
+        check_vive: Whether to check Vive server (auto-starts if down)
+        expected_cameras: How many ZED cameras the demo will use (auto-recovers
+                          if SDK sees fewer)
 
     Returns:
         bool: True if all critical checks passed
@@ -302,7 +547,7 @@ def run_preflight_check(check_robot=True, check_vive=True):
     check_and_kill_orphan_multiprocessing()
 
     # 3. Check cameras — KIST default is ZED; RealSense is optional fallback
-    if not check_zed_cameras():
+    if not check_zed_cameras(expected=expected_cameras):
         all_passed = False
     check_realsense_cameras()  # warn-only
 

@@ -211,6 +211,21 @@ class ArtGripperController(mp.Process):
                 print(f"[ArtGripperController] connected {self.host}:{self.port} "
                       f"max_width={gripper.metadata.max_width:.3f}m teleop={self.teleop_mode}")
 
+            # Open the gripper at boot — matches Isaac-GR00T's franka_env_kist.reset()
+            # behavior, where the gripper is reset alongside the arm's auto-home so
+            # the robot starts each session from a known fully-open state.
+            try:
+                gripper.goto(width=self.gripper_open_width,
+                             speed=self.move_max_speed,
+                             force=self.default_force,
+                             blocking=True)
+                if self.verbose:
+                    print(f"[ArtGripperController] startup: opened to "
+                          f"{self.gripper_open_width:.3f}m", flush=True)
+            except Exception as e:
+                if self.verbose:
+                    print(f"[ArtGripperController] startup open failed: {e}", flush=True)
+
             width_threshold = (self.gripper_open_width + self.gripper_close_width) / 2
 
             init = gripper.get_state()
@@ -228,6 +243,50 @@ class ArtGripperController(mp.Process):
             while keep_running:
                 t_now = time.monotonic()
 
+                # ---- explicit goto/grasp/shutdown from main process. Polled
+                # in BOTH teleop and normal modes so the demo can override
+                # regardless. Critical: must also honour SHUTDOWN here, or
+                # stop() will hang forever in teleop mode (the legacy NORMAL-
+                # mode handler at the bottom of this loop never sees it
+                # because we drained it up here).
+                try:
+                    explicit_batch = self.input_queue.get_all()
+                    n_explicit = len(explicit_batch.get('cmd', []))
+                    for j in range(n_explicit):
+                        ec = int(explicit_batch['cmd'][j])
+                        if ec == Command.SHUTDOWN.value:
+                            keep_running = False
+                            break
+                        if ec == Command.GOTO.value:
+                            target_pos = float(explicit_batch['target_pos'][j])
+                            speed = float(explicit_batch.get('speed', [self.move_max_speed])[j])
+                            try:
+                                gripper.goto(width=target_pos, speed=speed,
+                                             force=self.default_force, blocking=False)
+                                current_is_open = target_pos > width_threshold
+                                # CRITICAL: Reset last_teleop_cmd so the next
+                                # teleop CLOSE/OPEN from Vive is honoured even
+                                # if it matches the pre-HOME value. Without
+                                # this, the user has to press trigger 3 times
+                                # after a HOME-while-CLOSED to actually close
+                                # again (1st = stale-equal, ignored; 2nd =
+                                # OPEN to already-open, no change; 3rd =
+                                # actually closes).
+                                last_teleop_cmd = self.GRIPPER_CMD_NONE
+                                if self.verbose:
+                                    print(f"[ArtGripperController] explicit "
+                                          f"GOTO {target_pos:.3f}m "
+                                          f"(reset teleop cmd state)",
+                                          flush=True)
+                            except Exception as e:
+                                if self.verbose:
+                                    print(f"[ArtGripperController] explicit GOTO err: {e}",
+                                          flush=True)
+                    if not keep_running:
+                        break  # exit while-loop immediately
+                except Empty:
+                    pass
+
                 # ---- TELEOP ----
                 if self.teleop_mode:
                     try:
@@ -239,7 +298,17 @@ class ArtGripperController(mp.Process):
                                     else self.gripper_open_width)
                         if teleop_ts > last_teleop_ts:
                             last_teleop_ts = teleop_ts
-                            if cmd != self.GRIPPER_CMD_NONE and cmd != last_teleop_cmd:
+                            # If cmd just transitioned to NONE (e.g. ViveTeleopProcess
+                            # cleared it on HOME end, or after one-shot toggle),
+                            # also reset our latch so the next non-NONE cmd is
+                            # honoured even if it equals the pre-HOME value.
+                            # Without this, the first trigger press after a HOME
+                            # taken from a CLOSED state ends up as a no-op
+                            # because cmd==CLOSE matches the stale last_teleop_cmd.
+                            if cmd == self.GRIPPER_CMD_NONE:
+                                if last_teleop_cmd != self.GRIPPER_CMD_NONE:
+                                    last_teleop_cmd = self.GRIPPER_CMD_NONE
+                            elif cmd != last_teleop_cmd:
                                 try:
                                     if cmd == self.GRIPPER_CMD_CLOSE:
                                         gripper.grasp(width=target_w,

@@ -279,6 +279,12 @@ class SingleZed(mp.Process):
             t_loop = time.time()
             mat = sl.Mat()
             rt = sl.RuntimeParameters()
+            # 1-second moving-window FPS counter — instantaneous 1/Δt prints
+            # are useless because USB hiccups create backlogs that the next few
+            # iters drain in milliseconds, making the rate appear to jump
+            # 5↔80 even when the average is steady at the configured rate.
+            _fps_window_start = t_loop
+            _fps_window_iters = 0
 
             while not self.stop_event.is_set():
                 if cam.grab(rt) != sl.ERROR_CODE.SUCCESS:
@@ -377,10 +383,13 @@ class SingleZed(mp.Process):
                         put_start_time = float(commands['put_start_time'][i])
 
                 if self.verbose:
+                    _fps_window_iters += 1
                     now = time.time()
-                    fps = 1.0 / max(now - t_loop, 1e-6)
-                    t_loop = now
-                    print(f'[SingleZed {self.serial_number}] FPS {fps:.1f}')
+                    if now - _fps_window_start >= 1.0:
+                        avg_fps = _fps_window_iters / (now - _fps_window_start)
+                        print(f'[SingleZed {self.serial_number}] FPS {avg_fps:.1f} (1s avg)')
+                        _fps_window_start = now
+                        _fps_window_iters = 0
                 iter_idx += 1
         finally:
             # Ensure any in-progress recording is finalised (writes mp4 trailer)
