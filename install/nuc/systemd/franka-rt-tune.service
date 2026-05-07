@@ -1,0 +1,12 @@
+[Unit]
+Description=Franka RT tuning (NIC IRQ pinning, governor, ASPM, Turbo OFF)
+After=network-online.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/franka_rt_apply.sh
+
+[Install]
+WantedBy=multi-user.target

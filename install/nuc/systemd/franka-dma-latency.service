@@ -1,0 +1,11 @@
+[Unit]
+Description=Franka /dev/cpu_dma_latency lock at 0us
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/franka_dma_latency.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

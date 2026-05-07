@@ -25,15 +25,26 @@ NUC :50051 polymetis           pro4000 :50053 ART             └── Zarr rep
 
 Hardware Hz / call-rate decisions are documented in `docs/pipeline.md`.
 
+## Documentation
+
+| Doc | What's in it |
+|---|---|
+| [`docs/install_from_scratch.md`](docs/install_from_scratch.md) | Hardware → fully working teleop, Phase A→J, self-contained. NUC RT scripts shipped under [`install/nuc/`](install/nuc/), pro4000 install via [`install/install_pro4000.sh`](install/install_pro4000.sh) |
+| [`docs/usage.md`](docs/usage.md) | Daily TL;DR — once installed, this is the manual |
+| [`docs/pipeline.md`](docs/pipeline.md) | Hz / algorithm deep-dive (UMI controller, latency calibration, timestamp accumulator) |
+| [`docs/hardware_setup.md`](docs/hardware_setup.md) | Networking + cabling cheat sheet |
+| [`docs/teleop_tuning.md`](docs/teleop_tuning.md) | Vive ↔ Franka feel knobs (pos_scale, rot_scale, Kx, Kxd) |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptom → fix catalog |
+
 ## Hardware (KIST)
 
 | Role | Where | Notes |
 |---|---|---|
 | Franka Panda + 2-finger ART (or Franka Hand) | bench | Franka Desk → FCI Activate before bring-up |
-| NUC `192.168.1.12` (`kist@kist-NUC13ANHi7`) | wired direct | PREEMPT_RT kernel + RT IRQ pinning (Phase D in `docs/install_from_scratch.md`) |
+| NUC `192.168.1.12` (`kist@kist-NUC13ANHi7`) | wired direct | PREEMPT_RT kernel + RT IRQ pinning (Phase D — `install/nuc/`) |
 | pro4000 (`kist@kist-eval`, `161.122.114.90`) | wired | runs this repo + GR00T workspace + ART daemon |
 | ART gripper (Hyundai Motors) | EtherCAT NIC `enxb0386cf13036` | systemd `art-gripper-daemon` :50053 (auto-boot) |
-| ZED 2i `33538770` (exterior) | USB | LEFT eye only, 60 fps HD720 |
+| ZED 2i `33538770` (exterior) | USB | LEFT eye only, 60 fps native VGA (672×376) |
 | ZED Mini `11667817` (wrist) | USB | LEFT eye only |
 | HTC Vive controller | base stations × 2 | SteamVR + `vive_input` TCP :12345 |
 
@@ -46,7 +57,19 @@ Hardware Hz / call-rate decisions are documented in `docs/pipeline.md`.
 
 Training itself is out of scope here — fine-tune in `Isaac-GR00T` or your `diffusion_policy` repo and bring the checkpoint back to `eval_franka_policy.py`.
 
-## Bring up the stack (KIST quickstart)
+## Install (one-shot per host)
+
+```bash
+# (NUC) RT scripts + systemd units + sudoers drop-in
+sudo bash install/install_nuc.sh
+
+# (pro4000) groot-client conda env + this repo + ART client
+bash install/install_pro4000.sh
+```
+
+Full install walk-through in [`docs/install_from_scratch.md`](docs/install_from_scratch.md) — go there if you have only hardware.
+
+## Bring up the stack (after install)
 
 Pre-flight: `bash install/check_environment.sh` (each line OK / WARN / FAIL with hints).
 
@@ -98,6 +121,11 @@ Drop-in alternatives:
 * `--camera_backend realsense`   — RealSense instead of ZED (legacy UMI)
 * `--polymetis_mode zerorpc --robot_port 4242` — UMI/DROID-style bridge
 * `LIVE_DURATION=60 python examples/run_live_test.py` — 60 s headless live test
+
+Teleop feel: pass `--tuning_preset {coarse|normal|precise|custom}` to switch
+between Vive↔robot mappings and Cartesian impedance gains. See
+[`docs/teleop_tuning.md`](docs/teleop_tuning.md) for the symptom→knob table
+and safe ranges.
 
 ## Convert recorded data
 
@@ -172,16 +200,34 @@ Polymetis_Franka_Teleop/
 ├── LICENSE                               ← MIT (UMI portions also MIT)
 ├── pyproject.toml                        ← pip install -e .
 ├── docs/
-│   ├── install_from_scratch.md           ← zero-to-running install on KIST hw
+│   ├── install_from_scratch.md           ← Phase A→J full install (hardware → working teleop)
+│   ├── usage.md                          ← daily TL;DR
 │   ├── pipeline.md                       ← Hz/algorithm deep-dive
-│   └── hardware_setup.md                 ← network + cabling
+│   ├── hardware_setup.md                 ← network + cabling
+│   ├── teleop_tuning.md                  ← Vive ↔ Franka feel knobs
+│   └── troubleshooting.md                ← symptom → fix catalog
 ├── install/
-│   └── check_environment.sh              ← preflight dependency check
+│   ├── check_environment.sh              ← preflight dependency check
+│   ├── install_nuc.sh                    ← (NUC) copies install/nuc/* into /usr/local/sbin etc.
+│   ├── install_pro4000.sh                ← (pro4000) groot-client conda env + this repo
+│   └── nuc/                              ← raw RT scripts + systemd units shipped with the repo
+│       ├── README.md                     ← what each file does, manual prereqs
+│       ├── sbin/franka_rt_apply.sh        # boot-time NIC IRQ pin / governor / ASPM / Turbo
+│       ├── sbin/franka_dma_latency.py     # /dev/cpu_dma_latency 0us holder
+│       ├── sbin/franka_pin_helper.sh      # post-launch taskset of polymetis RT threads to 6,7
+│       ├── sbin/start_franka_arm.sh       # polymetis arm wrapper (auto pin)
+│       ├── sbin/start_franka_gripper.sh   # polymetis franka_hand wrapper
+│       ├── systemd/franka-rt-tune.service       # boot-time franka_rt_apply.sh
+│       ├── systemd/franka-dma-latency.service   # holds /dev/cpu_dma_latency at 0us
+│       ├── systemd/franka-realtime-setup.service  # optional sysctl tunings
+│       └── sudoers.d/franka_rt           # passwordless franka_pin_helper
 ├── bin/
 │   ├── start_teleop.sh                   ← demo_franka_vive wrapper (ART+ZED defaults)
 │   ├── start_eval.sh                     ← eval_franka_policy wrapper
-│   ├── start_vive_stack.sh               ← vrserver + vive_input bring-up
-│   └── start_unified_bridge_on_nuc.sh    ← optional ZeroRPC bridge launcher (UMI/DROID compat)
+│   ├── start_vive_stack.sh               ← vrserver --keepalive + vive_input bring-up
+│   ├── start_unified_bridge_on_nuc.sh    ← optional ZeroRPC bridge launcher (UMI/DROID compat)
+│   ├── run_test_session.sh               ← setsid'd long-running session launcher
+│   └── cv2_viewer.py                     ← cv2.imshow subprocess (signal relay to demo)
 ├── polymetis_franka_teleop/              ← Python package (pip install -e .)
 │   ├── shared_memory/                    ← lock-free SHM primitives (UMI vendored)
 │   ├── common/                           ← pose math, precise_sleep, latency, accumulators

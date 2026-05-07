@@ -1,0 +1,5 @@
+# /etc/sudoers.d/franka_rt -- let the regular user invoke franka_pin_helper
+# without a password (called from start_franka_arm.sh / start_franka_gripper.sh
+# 5 s after launch). Replace 'kist' with the actual login user if different.
+kist ALL=(ALL) NOPASSWD: /usr/local/sbin/franka_pin_helper.sh
+kist ALL=(ALL) NOPASSWD: /usr/bin/taskset -cpa *

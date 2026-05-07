@@ -1,215 +1,647 @@
 # Polymetis_Franka_Teleop — Install from scratch
 
-KIST 환경 (NUC + pro4000 + Franka Panda + ZED + ART gripper + Vive) 처음부터 끝까지 재현 가이드.
+Hardware-only → fully working Vive teleop + data collection in one pass.
+Modeled on the same phase structure as the sister Isaac-GR00T install
+guide; the two share the NUC realtime setup so a NUC tuned for one is
+ready for the other.
 
-이 문서 + `git clone` 만 있으면 동일 환경 재구성 가능. 일상 운용은 [`README.md`](../README.md) 의 *Bring up the stack* 섹션 참조.
+## Table of contents
 
-> **이 문서의 범위**: 이 워크스페이스 (`Polymetis_Franka_Teleop`) 가 동작하기 위한 모든 의존성 + 설정.
-> Polymetis/Franka 자체의 처음 셋업 (PREEMPT_RT 커널, libfranka, RT IRQ 핀 등 NUC 시스템 레벨)
-> 은 자매 문서 [`Isaac-GR00T/INSTALL_FROM_SCRATCH.md`](../../Isaac-GR00T/INSTALL_FROM_SCRATCH.md)
-> §3–§9 참고 (KIST 에서 GR00T + 본 repo 둘 다 같은 NUC 셋업 공유).
-
----
-
-## 0. 요약 — 시스템 토폴로지
-
-```
-[Franka Panda + ART gripper]
-   ↑ FCI 1 kHz Ethernet (172.16.0.2)
-   │
-[NUC i7-1360P] (Ubuntu 22.04 PREEMPT_RT)
-   ├ libfranka realtime client    cores 6,7 핀 (P-core 격리)
-   ├ polymetis_server :50051      gRPC server, 1 kHz inner loop
-   ├ franka_hand_client :50052    (Franka Hand 사용 시)
-   └ launch_franka_unified_server.py :4242  (선택 — UMI/DROID 호환 ZeroRPC bridge)
-   │
-   │ 1 Gbps 유선 / RTT < 1 ms
-   ↓
-[pro4000 RTX 4000 Blackwell] (Ubuntu 22.04, kist-eval)
-   ├ Polymetis_Franka_Teleop      ← 이 repo
-   │   ├ FrankaInterpolationController (mp.Process, 100 Hz)
-   │   ├ ViveTeleopProcess (mp.Process, 100 Hz)
-   │   ├ MultiZed (mp.Process×N, 60 fps capture)
-   │   ├ FrankaGripperController / ArtGripperController (mp.Process, 30 Hz)
-   │   └ Main loop (10 Hz, Zarr + H264 MP4 기록)
-   ├ Hyundai_motors_Gripper       ← 자매 repo (ART daemon + python client)
-   │   └ /usr/local/bin/art_gripper_daemon (systemd, EtherCAT :50053)
-   ├ SteamVR + vive_input         ← Vive 트래킹 + TCP 서버 :12345
-   └ ZED 2i + ZED Mini (USB)
-```
-
-전체 파이프라인 hz / 통신 / 핀 결정 근거는 [`docs/pipeline.md`](pipeline.md) 참고.
+- [§0 How to use this document](#0-how-to-use-this-document)
+- [§1 Hardware bill of materials](#1-hardware-bill-of-materials)
+- [§2 System topology + networking](#2-system-topology--networking)
+- [§A Franka Desk pre-config](#phase-a--franka-desk-pre-config)
+- [§B NUC OS base + PREEMPT_RT kernel](#phase-b-nuc-os-base--preempt_rt-kernel)
+- [§C NUC Polymetis build](#phase-c-nuc-polymetis-build)
+- [§D NUC RT permanent tuning (KIST scripts, included in this repo)](#phase-d-nuc-rt-permanent-tuning)
+- [§E pro4000 OS base + GPU](#phase-e-pro4000-os-base--gpu)
+- [§F pro4000 ZED SDK + cameras](#phase-f-pro4000-zed-sdk--cameras)
+- [§G pro4000 conda env (`groot-client`) + Polymetis client](#phase-g-pro4000-groot-client-env)
+- [§H pro4000 ART gripper daemon](#phase-h-pro4000-art-gripper-daemon)
+- [§I pro4000 SteamVR + vive_input](#phase-i-pro4000-steamvr--vive_input)
+- [§J Verification sequence (incremental)](#phase-j-verification-sequence)
+- [§13 Troubleshooting catalog](#13-troubleshooting-catalog)
 
 ---
 
-## 1. NUC 시스템 셋업 (한 번)
+## 0. How to use this document
 
-GR00T 작업 때 이미 셋업했다면 그대로 재사용. 처음 한다면 `Isaac-GR00T/INSTALL_FROM_SCRATCH.md` §3–§6 단계별 따라가기:
+### Recommended order
 
-| 단계 | 내용 | KIST 핵심 결정 |
+1. Read §1, §2 — confirm you have the hardware.
+2. §A (Franka Desk web UI, one-time, in a browser) — independent of any host.
+3. §B → §C → §D — NUC, in front of its monitor (ssh comes later).
+4. §E → §F → §G → §H → §I — pro4000, monitor or ssh.
+5. §J — incremental verification, do **not** skip.
+6. Once §J passes, daily use lives in [`USAGE.md`](USAGE.md).
+
+### Conventions
+
+- Each command block runs on **one host**. The host is named in the section heading: `(NUC)` or `(pro4000)`.
+- `<TODO>` placeholders mean "fill in for your environment".
+- Numbers in the "Verify" column of §J are KIST measurements; yours should be in the same ballpark.
+
+---
+
+## 1. Hardware bill of materials
+
+| Role | KIST baseline (verified) | Minimum / acceptable substitute |
 |---|---|---|
-| §3 | Franka Desk 사전 설정 | FCI 활성화, end-effector 질량/CoM 입력 |
-| §4 | NUC OS — Ubuntu 22.04 + **PREEMPT_RT 커널** | `uname -a` 에 `PREEMPT_RT` 포함 |
-| §4-2 | GRUB `isolcpus=domain,managed_irq,6-7 nohz_full=6,7 rcu_nocbs=6,7` | P-core 6,7 RT 격리 |
-| §4-3 | libfranka 빌드 + 설치 | Franka 공식 가이드 |
-| §5 | fairo (Polymetis) clone + build, `polymetis-local` conda env | NUC 내부에서만 |
-| §6 | RT 영구 튜닝 (`franka_pin_helper.sh`, NIC IRQ E-core 핀, RPS/XPS, Turbo OFF) | **이게 watchdog/jitter 안정성의 결정타** |
-| §6-3 | systemd 자동 핀: `franka-rt-tune`, `franka-dma-latency` | 부팅 시 auto-apply |
+| Robot | Franka Panda + Franka Controller Box (172.16.0.2) + ART 2-finger gripper *or* Franka Hand | Any FCI-licensed Franka Panda |
+| **Realtime PC (NUC)** | Intel i7-1360P (4 P-core HT + 8 E-core), 64 GB RAM, 2 NICs (Franka direct + Lab) | Any Intel hybrid CPU, PREEMPT_RT-capable, ≥2 NICs |
+| **Inference / data PC (pro4000)** | RTX PRO 4000 Blackwell SFF 24 GB sm_120 (verified) — RTX 3090 also verified | RTX 3090 / 4090 / Pro 4000–6000; 64 GB RAM; Ubuntu 22.04 + recent CUDA |
+| Exterior camera | ZED 2i (S/N `33538770`) | ZED 2 / 2i (DROID baseline) |
+| Wrist camera | ZED Mini (S/N `11667817`) | ZED Mini |
+| USB cables (cameras) | USB 3.0 SuperSpeed C-C | USB 3.0 only — USB 2.0 cables enumerate only the HID side, UVC will fail |
+| Teleop input | HTC Vive controller + 2 Lighthouse base stations + (HMD or tracker dummy) | HTC Vive Pro / 1.0 controllers; Index works too if you re-bind buttons |
+| EtherCAT NIC (ART gripper) | `enxb0386cf13036` direct to NETX 90-RE/ECS | Any IgH-EtherCAT-compatible NIC |
+| Networking | 1 Gbps NIC NUC↔Franka (direct), 1 Gbps NIC NUC↔pro4000 (lab subnet) | FCI guideline: ≤1 ms RTT |
 
-**RT 튜닝 필수 이유** (KIST 실측 기반):
-- `isolcpus=6,7` 만으로는 부족 — `franka_pin_helper.sh` 로 launch 후 명시 `taskset` 필수
-- NIC IRQ default 가 P-core 0–5 분산 → GUI 와 경쟁 → success_rate 0.79 → reflex 발생
-- → NIC IRQ 를 E-core 12–15 로 명시 핀
-- RPS/XPS off (default) → RX/TX softirq 가 임의 코어로 → E-core mask 명시
-- Turbo Boost ON → P-core 주파수 변동 → RT jitter → OFF 권장
-
-이 작업이 안 되면 우리 repo 의 `polymetis-direct` 100 Hz 도 watchdog trip 가능.
+The Vive controller in particular is the dominant constraint: this repo
+expects the C++ binary `vive_input` (built from the user's `vive_ws`) to
+publish the controller pose over TCP `:12345`. SteamVR Linux can be flaky
+on first boot — see §I for the headless `vrserver --keepalive` workaround.
 
 ---
 
-## 2. NUC — 본 repo 가 사용하는 부분
+## 2. System topology + networking
 
-```bash
-# /usr/local/sbin/start_franka_arm.sh 가 이미 깔려 있어야 함 (GR00T 셋업)
-ls /usr/local/sbin/start_franka_arm.sh   # OK 있어야
-
-# Franka Hand 쓸 때만:
-ls /usr/local/sbin/start_franka_gripper.sh
-
-# ZeroRPC bridge 쓰려면 (선택):
-# pro4000 의 bin/start_unified_bridge_on_nuc.sh 가 자동 deploy + launch
+```
+[Franka Panda + ART (or Franka Hand)]
+    │ EtherCAT
+    ▼
+[Franka Controller Box  172.16.0.2]
+    │ 1 Gbps  (FCI ≤1 ms RTT)
+    ▼
+[NUC]
+  enp86s0  172.16.0.1/24    ← Franka FCI (direct, dedicated NIC)
+  enp87s0  192.168.1.12/24  ← Lab subnet (talks to pro4000)
+    │
+    │ 1 Gbps  (≤0.2 ms RTT)
+    ▼
+[pro4000]                                   (kist-eval, 161.122.114.90)
+  enp130s0          192.168.1.20/24  ← Lab subnet
+  enxb0386cf13036   161.122.115.1    ← EtherCAT direct to ART (or empty for Franka Hand workflow)
+  USB 3.0           ZED 2i (sn 33538770)
+  USB 3.0           ZED Mini (sn 11667817)
+  USB 2.0           HTC Vive controller (via Lighthouse)
 ```
 
-ART gripper 만 쓰는 KIST 워크플로에서는 NUC 에 **arm 서버만** 띄움. franka_hand 는 안 띄워도 됨.
+Ports the stack listens on:
+
+| Service | Where | Port | Notes |
+|---|---|---|---|
+| Polymetis arm gRPC | NUC | 50051 | `start_franka_arm.sh` |
+| Polymetis franka_hand gRPC | NUC | 50052 | `start_franka_gripper.sh` (skip for ART) |
+| ZeroRPC unified bridge (optional) | NUC | 4242 | `bin/start_unified_bridge_on_nuc.sh` |
+| ART gripper daemon | pro4000 | 50053 | systemd, auto-start |
+| `vive_input` | pro4000 | 12345 (TCP) / 12346 (UDP) | from `vive_ws` |
+
+> **Why NUC↔Franka must be direct** (not through a switch): switches add
+> jitter and an extra IRQ path that's hard to keep off the realtime cores.
+> Already-verified at KIST: 172.16.0.2 ↔ 172.16.0.1 RTT 0.13 ms over a
+> direct cable, ~0.6 ms with a small consumer switch.
 
 ---
 
-## 3. pro4000 — repo 클론 + conda env
+## Phase A — Franka Desk pre-config
+
+(Browser only, one-time per Franka Controller Box.)
+
+1. From any PC on the lab subnet, open `https://172.16.0.2/desk/` and accept the self-signed certificate.
+2. Log in with the Franka account printed on the controller box.
+3. **Unlock joints** — click the grey indicator until it turns blue ("Joints brake released").
+4. **End-Effector → Settings → Custom EE** (because we run ART, not Franka Hand). For ART + ZED Mini wrist, use these (re-measure after any swap with `~/Isaac-GR00T/scripts/kist/measure_ee_load.py`):
+
+| Field | Value |
+|---|---|
+| Mass | 1.05 kg |
+| Flange→CoM | (0, 0.010, 0.100) m |
+| Flange→TCP | (0, 0, 0.216, 0, 0, 0) — finger tip |
+| Inertia diag | (0.004, 0.004, 0.001) |
+
+For Franka Hand workflow, just pick the built-in **Franka Hand** EE.
+
+5. **Activate FCI** — top-right menu → Activate FCI. Status pill should turn green.
+6. e-stop released, base mounted, no obstacles inside the workspace.
+
+> If FCI Activate is greyed out: the EE selection is wrong, or the EE
+> is not physically attached. Re-seat the connector and reboot the
+> controller box. Catalog #11 in §13.
+
+---
+
+## Phase B — NUC OS base + PREEMPT_RT kernel
 
 ```bash
-# 1) 자매 repo (필수)
-cd $HOME
-git clone <YOUR_GIT>/Hyundai_motors_Gripper       # ART gripper daemon + python client
-git clone <YOUR_GIT>/Polymetis_Franka_Teleop      # 본 repo
-git clone https://github.com/columbia-ai-robotics/diffusion_policy   # ReplayBuffer 등 의존
+# (Ubuntu 22.04.5 LTS installed.)
+# PREEMPT_RT 6.8.0-rt8 kernel — install per Franka's guide:
+#   https://frankaemika.github.io/docs/installation_linux.html
+# Or via Ubuntu Pro -> ubuntu-realtime metapackage.
 
-# 2) ART daemon 설치 + systemd 등록 (Hyundai_motors_Gripper README 참고)
-cd ~/Hyundai_motors_Gripper
-sudo bash scripts/install_etherlab.sh    # 첫 셋업만
-sudo bash scripts/install_daemon.sh --system
-systemctl enable --now art-gripper-daemon
+uname -a   # must contain 'PREEMPT_RT'  (KIST: 6.8.0-rt8 SMP PREEMPT_RT)
+```
 
-# 3) ZED SDK + pyzed (본 repo 가 사용)
-#    https://www.stereolabs.com/developers/release/  → Linux x86_64 .run
-#    설치 후 python -c 'import pyzed.sl' 동작 확인
+### B-2. GRUB cmdline (`/etc/default/grub`)
 
-# 4) 본 repo conda env (groot-client 재사용 가능)
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate groot-client    # GR00T 작업 때 만든 env (polymetis client + pyzed + zerorpc)
+```
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_idle.max_cstate=0 processor.max_cstate=0 isolcpus=domain,managed_irq,6-7 nohz_full=6,7 rcu_nocbs=6,7 irqaffinity=0-5"
+```
 
-# 5) 본 repo pip install + ART client 의존
-cd ~/Polymetis_Franka_Teleop
+`isolcpus=6-7` reserves the second P-core (both hyperthreads) of the
+i7-1360P for realtime work. `managed_irq` keeps managed device IRQs
+(NVMe, etc.) off those cores. `nohz_full` + `rcu_nocbs` stop the timer
+tick + RCU callbacks on those cores, and `irqaffinity=0-5` is the
+fallback for any IRQs we did not explicitly pin in §D.
+
+```bash
+sudo update-grub
+sudo reboot
+# After reboot:
+cat /proc/cmdline   # verify the parameters above
+```
+
+### B-3. libfranka
+
+```bash
+sudo apt install -y libfranka                 # 0.15.0 verified on KIST
+# or, if the apt pin is wrong for your controller box version:
+git clone --recursive https://github.com/frankaemika/libfranka.git ~/libfranka
+cd ~/libfranka && mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j && sudo make install
+```
+
+### B-4. SSH key from pro4000 to NUC
+
+The pro4000 helper scripts (`bin/start_unified_bridge_on_nuc.sh`,
+`scripts/kist/cleanup_all.sh` in Isaac-GR00T) ssh into the NUC. Set up
+key-based auth once:
+
+```bash
+# On pro4000:
+ssh-copy-id kist@192.168.1.12
+ssh kist@192.168.1.12 'echo OK'   # must print OK with no password prompt
+```
+
+---
+
+## Phase C — NUC Polymetis build
+
+NUC-side, ~30–60 min.
+
+```bash
+# C-1. miniconda3 (skip if already installed)
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh        # installs to ~/miniconda3
+
+# C-1b. build deps
+sudo apt install -y build-essential cmake git libpoco-dev libeigen3-dev \
+    pkg-config python3-dev libhidapi-dev libusb-1.0-0-dev
+
+# C-2. fairo (Polymetis source)
+git clone --recursive https://github.com/facebookresearch/fairo.git ~/fairo
+cd ~/fairo && git submodule update --init --recursive
+
+# C-3. polymetis-local conda env
+source ~/miniconda3/etc/profile.d/conda.sh
+cd ~/fairo/polymetis
+conda env create -f polymetis/environment.yml -n polymetis-local
+conda activate polymetis-local
+
+# C-4. build
+mkdir -p polymetis/build && cd polymetis/build
+cmake .. -DBUILD_FRANKA=ON
+make -j$(nproc)
+ls polymetis/build/run_server polymetis/build/franka_panda_client polymetis/build/franka_hand_client
+ls polymetis/build/torch_isolation/lib*.so
+
+# C-5. polymetis Python package
+cd ~/fairo/polymetis
 pip install -e .
-pip install -e ~/Hyundai_motors_Gripper/python   # art_gripper_client 모듈
+python -c "from polymetis import RobotInterface; print('OK')"
 
-# 6) 환경 점검
-bash install/check_environment.sh   # OK / WARN / FAIL 출력
+# C-6. ping the Franka box
+ping -c 3 172.16.0.2     # expect <1 ms RTT
 ```
 
-**`groot-client` env 가 이미 있어야 하는 패키지** (GR00T INSTALL_FROM_SCRATCH §9 와 동일):
-- `polymetis` (pro4000 측 클라이언트 — direct mode 시 사용)
-- `pyzed.sl`
-- `zerorpc` (zerorpc bridge mode 시 사용)
-- `pynput`, `av`, `zarr<3`, `atomics`, `pyarrow`, `dill`
-- `diffusion_policy` (~/diffusion_policy 의 PYTHONPATH 또는 pip install -e)
+### C-7. Smoke test (Polymetis on its own, no motion)
+
+```bash
+# Terminal A: arm server
+conda activate polymetis-local
+cd ~/fairo/polymetis/polymetis/python/scripts
+python launch_robot.py robot_client=franka_hardware ip=0.0.0.0 port=50051
+# wait for "Connected" (one sudo prompt)
+
+# Terminal B: gripper server (only Franka Hand workflow)
+conda activate polymetis-local
+python launch_gripper.py gripper=franka_hand
+# Connecting to robot_ip 172.16.0.2 -> listening
+```
+
+Ctrl-C both terminals when done — we will run them via the wrappers from §D from now on.
 
 ---
 
-## 4. Vive 입력 셋업 (이 repo 만의 추가)
+## Phase D — NUC RT permanent tuning
+
+> **This phase is what makes Polymetis stable.** Skip it and you will see
+> reflex trips on contact (`communication_constraints_violation`,
+> `success_rate ≈ 0.79`) within seconds of starting any client.
+
+### D-1. Why each tunable matters (KIST measurements)
+
+| Knob | Default | What goes wrong | Fixed by |
+|---|---|---|---|
+| `isolcpus=6,7` | none | RT thread shares cores with GUI / Chrome / Slack | GRUB §B-2 |
+| `taskset -cpa 6,7` of `run_server` & `franka_panda_client` | not done | `isolcpus` only *prevents* default scheduling; it doesn't *pull* threads in. RT threads still spawn on whatever core | `franka_pin_helper.sh` (this phase) |
+| NIC IRQ affinity | spread across P-cores 0-5 | NIC IRQ competes with GUI on P-core; success_rate drops to 0.79 → reflex | `franka_rt_apply.sh` pins to E-cores 12-15 |
+| RPS / XPS | off | Softirq RX/TX bounces between cores; cache-cold packets | `franka_rt_apply.sh` sets RPS/XPS mask |
+| Turbo Boost | on | P-core frequency oscillates → RT jitter | `franka_rt_apply.sh` writes `no_turbo=1` |
+| PCIe ASPM | default | NIC wake-up adds tens of µs | `franka_rt_apply.sh` sets policy=performance |
+| GUI cpuset | unbounded | Firefox / GNOME shell drift onto cores 6,7 (they're "isolated", not "forbidden") | `franka_rt_apply.sh` mass-tasksets GUI to 0-3 |
+| `/dev/cpu_dma_latency` | open | Cores enter deep C-states between 1 kHz iterations | `franka_dma_latency.py` holds it at 0us |
+| `irqbalance` | running | Periodically rebalances IRQs, undoing our pin | `franka_rt_apply.sh` stops the unit |
+
+### D-2. One-shot install from this repo
+
+The 9 scripts + 2 systemd units + 1 sudoers drop-in are in
+[`install/nuc/`](../install/nuc/). The wrapper [`install/install_nuc.sh`](../install/install_nuc.sh)
+copies them into place and enables both services:
 
 ```bash
-# SteamVR (Steam GUI 에서 SteamVR install)
-ls ~/.steam/debian-installation/steamapps/common/SteamVR/bin/linux64/vrserver
+# (NUC) clone this repo (just for the install dir; runtime lives elsewhere)
+git clone https://github.com/Seung-Sub/Polymetis_Franka_Teleop.git ~/Polymetis_Franka_Teleop
+cd ~/Polymetis_Franka_Teleop
 
-# vive_input C++ 바이너리 (ROS-free, OpenVR + nlohmann/json)
-#   원본 source: ~/Isaac-GR00T/vive_input/  (KIST 기존 보유)
-#   이미 빌드돼 있어야 함:
-ls ~/vive_ws/build/vive_ros2/vive_input  # 또는 ~/Isaac-GR00T/vive_input/build/vive_input
-
-# HTC Vive 컨트롤러 + base station 2개 + (HMD 또는 트래커 dummy)
-lsusb | grep -i htc       # HTC 디바이스 인식 확인
-sudo chmod +rw /dev/hidraw*   # 첫 셋업 시 1회
-
-# 부팅 (`bin/start_vive_stack.sh`):
-bash ~/Polymetis_Franka_Teleop/bin/start_vive_stack.sh start   # vrserver --keepalive + vive_input :12345
-bash ~/Polymetis_Franka_Teleop/bin/start_vive_stack.sh status
+# Edit the user name in install/nuc/sudoers.d/franka_rt if it isn't 'kist'
+sudo bash install/install_nuc.sh
 ```
 
-`vrserver --keepalive` 는 헤드리스 (GUI 불필요) 라 SSH 환경에서도 띄울 수 있음.
+The script:
+1. Copies `install/nuc/sbin/*` → `/usr/local/sbin/` (mode 755).
+2. Copies `install/nuc/systemd/*.service` → `/etc/systemd/system/`.
+3. Copies `install/nuc/sudoers.d/franka_rt` → `/etc/sudoers.d/` (mode 440), with `visudo -c` validation.
+4. `systemctl enable --now franka-rt-tune franka-dma-latency` (and optionally `franka-realtime-setup`).
 
----
-
-## 5. 첫 부팅 시퀀스 (모든 컴포넌트 가동)
+### D-3. Verify
 
 ```bash
-# 0. Franka Desk 웹UI 에서 FCI Activate, e-stop 풀기, joint locks 해제
+# IRQ -> E-cores 12-15
+for irq in $(grep enp86s0 /proc/interrupts | awk '{print $1}' | tr -d ':'); do
+    echo "IRQ $irq: $(cat /proc/irq/$irq/smp_affinity_list)"
+done
 
-# 1. NUC arm 서버
-ssh kist@192.168.1.12
+# RPS mask
+cat /sys/class/net/enp86s0/queues/rx-0/rps_cpus            # f000
+
+# governor / turbo / ASPM
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor  # performance
+cat /sys/devices/system/cpu/intel_pstate/no_turbo          # 1
+cat /sys/module/pcie_aspm/parameters/policy                # [performance]
+
+# systemd
+systemctl status franka-rt-tune franka-dma-latency
+```
+
+### D-4. Run Polymetis through the wrappers (from now on, every session)
+
+```bash
+# (NUC, terminal 1) arm
 sudo bash /usr/local/sbin/start_franka_arm.sh
-# "Connected." 메시지까지 기다림
+# 5 s after launch_robot.py prints "Connected", you should see:
+#   [arm pinner] cores 6,7 pin applied (details: tail ~/.franka_logs/franka_pin_arm.log)
 
-# 2. (Franka Hand 만 쓸 때) NUC gripper 서버
-ssh kist@192.168.1.12
+# (NUC, terminal 2)  ONLY for Franka Hand workflow:
 sudo bash /usr/local/sbin/start_franka_gripper.sh
+```
 
-# 3. (선택, zerorpc 모드) NUC unified bridge
-ssh kist@161.122.114.90      # pro4000
-bash ~/Polymetis_Franka_Teleop/bin/start_unified_bridge_on_nuc.sh   # 자동 ssh + deploy + launch
+If the pinner line doesn't appear, the install was incomplete — re-run `install_nuc.sh` and reboot the NUC.
 
-# 4. pro4000 — ART gripper daemon (자동 부팅, 평소 손댈 일 없음)
-systemctl status art-gripper-daemon
+---
 
-# 5. pro4000 — Vive
-bash ~/Polymetis_Franka_Teleop/bin/start_vive_stack.sh start
+## Phase E — pro4000 OS base + GPU
 
-# 6. pro4000 — preflight
-cd ~/Polymetis_Franka_Teleop && bash install/check_environment.sh
+```bash
+# Ubuntu 22.04, NVIDIA driver + CUDA pre-installed (manufacturer image works).
+nvidia-smi   # KIST: RTX PRO 4000 Blackwell SFF, driver 580.126.09, CUDA 13
+lsb_release -a   # 22.04 jammy
 
-# 7. pro4000 — 데이터 수집
-bash bin/start_teleop.sh ~/Polymetis_Franka_Teleop/data/$(date +%Y%m%d_%H%M%S)
+# anaconda or miniconda at $HOME/anaconda3 (or $HOME/miniconda3)
+ls $HOME/anaconda3/bin/conda || ls $HOME/miniconda3/bin/conda
+```
+
+This repo does **not** require the `groot` (training) env; only `groot-client`
+(client-side Polymetis + ZED + Vive). If you've already done Isaac-GR00T's
+INSTALL_FROM_SCRATCH §7, the training env is a bonus, not a prerequisite.
+
+---
+
+## Phase F — pro4000 ZED SDK + cameras
+
+### F-1. ZED SDK 5.3
+
+```bash
+mkdir -p ~/Downloads && cd ~/Downloads
+curl -L -o ZED_SDK.run \
+    'https://stereolabs.sfo2.cdn.digitaloceanspaces.com/zedsdk/5.3/ZED_SDK_Ubuntu22_cuda13.0_tensorrt10.13_v5.3.0.zstd.run'
+chmod +x ZED_SDK.run
+sudo bash ZED_SDK.run --silent --skip_python --skip_cuda
+sudo chmod -R a+rX /usr/local/zed
+```
+
+If the silent installer hangs on `pam-auth-update` (some Ubuntu images do this):
+
+```bash
+sudo killall pam-auth-update
+sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+```
+
+### F-2. Camera calibration files
+
+Each ZED needs its serial-number-keyed `.conf` to be on disk locally
+(otherwise pyzed tries to download it via its built-in libcurl, which
+fights with the conda LD-library overrides — see catalog #22):
+
+```bash
+sudo mkdir -p /usr/local/zed/settings
+for SN in 33538770 11667817; do
+    sudo curl -fsSL -o /usr/local/zed/settings/SN${SN}.conf \
+        "https://calib.stereolabs.com/?SN=${SN}"
+done
+ls /usr/local/zed/settings/
+```
+
+### F-3. USB enumeration check
+
+```bash
+lsusb | grep -iE 'stereolabs|zed'
+# Expect:
+#   2b03:f880 STEREOLABS ZED 2i           (UVC, USB 3.0)
+#   2b03:f682 STEREOLABS ZED-M camera     (UVC, USB 3.0)
+#   2b03:f881 STEREOLABS ZED-2i HID
+#   2b03:f681 STEREOLABS ZED-M HID
+
+lsusb -t | grep -B1 5000M    # both UVCs must show 5 Gbps
+```
+
+If only the HID side appears, you have a USB 2.0 cable masquerading as 3.0.
+Replace it. (`dmesg | grep -i "USB cable is bad"` confirms.)
+
+---
+
+## Phase G — pro4000 `groot-client` env
+
+Same env Isaac-GR00T uses, so the two repos can coexist with no env switching.
+
+```bash
+cd ~/Polymetis_Franka_Teleop
+sudo apt install -y ffmpeg                # H264 mux for video_recorder.py
+bash install/install_pro4000.sh           # creates / updates groot-client
+```
+
+`install_pro4000.sh`:
+1. Creates conda env `groot-client` (Python 3.8) if absent.
+2. `pip install` torch 1.13.1, grpcio, hydra, zarr<3, av, opencv, zerorpc, pynput, etc.
+3. `pip install -e .` for this repo.
+4. `pip install -e ~/Hyundai_motors_Gripper/python` for the ART client (skipped if not present).
+
+If you don't have an existing Polymetis client artifact tree on pro4000,
+also follow Isaac-GR00T's INSTALL_FROM_SCRATCH §9 (Phase G) — that step
+rsyncs the NUC's `fairo-polymetis/build/torch_isolation/` and
+`nuc_libs/` to pro4000 so `from polymetis import RobotInterface` works
+on the client side. See `Polymetis_Franka_Teleop/docs/troubleshooting.md`
+catalog #6 for the LD_LIBRARY_PATH pitfalls.
+
+---
+
+## Phase H — pro4000 ART gripper daemon
+
+The Hyundai ART gripper has its own ROS-free EtherCAT daemon, shipped
+in the [`Hyundai_motors_Gripper`](https://github.com/Seung-Sub/Hyundai_motors_Gripper)
+sister repo.
+
+```bash
+git clone https://github.com/Seung-Sub/Hyundai_motors_Gripper.git ~/Hyundai_motors_Gripper
+cd ~/Hyundai_motors_Gripper
+
+# IgH EtherCAT master kernel module (one-shot)
+sudo bash scripts/install_etherlab.sh
+
+# Daemon binary + systemd unit
+sudo bash scripts/install_daemon.sh --system
+sudo systemctl enable --now art-gripper-daemon
+systemctl is-active art-gripper-daemon       # active
+
+# TCP port 50053 should be listening
+ss -tln | grep 50053
+```
+
+`art-gripper-daemon.service` requires `ethercat.service` (also installed by
+`install_etherlab.sh`) and pulls in the `LimitMEMLOCK=infinity` +
+`LimitRTPRIO=99` knobs the daemon needs to enter realtime priority.
+
+If the gripper latches a fault later (hot-unplug, motor stall, etc.):
+
+```bash
+sudo bash ~/Hyundai_motors_Gripper/scripts/restart_gripper.sh
+# stops daemon -> reloads ethercat kmod -> starts daemon -> ping verify
 ```
 
 ---
 
-## 6. KIST 운용 노트 — GR00T 워크스페이스와의 공존
+## Phase I — pro4000 SteamVR + vive_input
 
-본 repo 와 `Isaac-GR00T` 워크스페이스는 **NUC 측 polymetis 서버 + ART daemon + ZED 카메라 + RT 튜닝을 공유**합니다. 동시에 띄우지는 못하지만 (서로 카메라/그리퍼 점유), 다음 패턴으로 번갈아 사용 가능:
+The Vive controller pose enters this repo over TCP `:12345` (and an
+optional UDP haptic feedback channel on `:12346`). The publisher is the
+C++ binary `vive_input` from the user's `vive_ws` workspace. SteamVR
+provides the raw OpenVR poses to it.
 
-| 작업 | 사용 워크스페이스 | 부팅 명령 |
-|---|---|---|
-| GR00T 추론 (Vive 미사용) | `Isaac-GR00T` | `start_franka_arm.sh` + `start_groot_server_*.sh` + `start_groot_client_art.sh` |
-| Vive teleop 데이터 수집 | `Polymetis_Franka_Teleop` | `start_franka_arm.sh` + `start_vive_stack.sh` + `bin/start_teleop.sh` |
-| Diffusion Policy eval | `Polymetis_Franka_Teleop` | `start_franka_arm.sh` + `bin/start_eval.sh <ckpt>` |
+### I-1. SteamVR
 
-NUC 측 `start_franka_arm.sh` 는 둘 다 동일하게 사용. 카메라/그리퍼는 한 번에 한 워크스페이스만 점유.
+Install Steam GUI, log in, install SteamVR. Verify the binary exists:
+
+```bash
+ls ~/.steam/debian-installation/steamapps/common/SteamVR/bin/linux64/vrserver
+```
+
+The first time you launch SteamVR, you also need to pair your Vive
+controller through the Steam GUI. After pairing, daily use never needs
+the GUI again — `vrserver --keepalive` is headless.
+
+### I-2. `vive_input` binary
+
+```bash
+ls ~/vive_ws/build/vive_ros2/vive_input
+# or the symlink:
+ls ~/vive_ws/install/vive_ros2/lib/vive_ros2/vive_input
+```
+
+This binary is built outside this repo (it's part of `vive_ws`, a
+ROS-free OpenVR + nlohmann-json publisher); the source isn't shipped
+here. KIST keeps it under `~/vive_ws/`. If you don't have it, see the
+Isaac-GR00T documentation — the same `vive_aliases.sh` setup applies.
+
+### I-3. udev / hidraw
+
+```bash
+lsusb | grep -i htc          # HTC controller(s) appear
+sudo chmod +rw /dev/hidraw*   # one-shot per boot or write a udev rule
+```
+
+### I-4. Bring it up
+
+```bash
+bash bin/start_vive_stack.sh start    # starts vrserver --keepalive + vive_input :12345
+bash bin/start_vive_stack.sh status
+
+# Expected:
+#   vrserver       : RUNNING (pid …)
+#   vive_input     : RUNNING (~/vive_ws/build/vive_ros2/vive_input)
+#   port 12345 TCP : LISTENING
+#   port 12346 UDP : bound
+#   HTC/Valve USB  : ≥2 device(s)
+```
+
+`vrserver --keepalive` runs without a desktop, so the whole Vive stack
+works fine over SSH after the one-time GUI pairing.
 
 ---
 
-## 7. 알려진 한계 + 향후 개선
+## Phase J — Verification sequence
 
-| 항목 | 현재 | 개선 여지 |
-|---|---|---|
-| NUC realtime watchdog (1s) | `direct` 100 Hz / `zerorpc` 100 Hz 안정 | NUC RT 튜닝 강화로 200 Hz 도전 가능 (UMI 사례) |
-| ZED Mini USB 2회 hot-plug 후 재인식 | 사용자 수동 재연결 필요 | udev rule 정리 (TODO) |
-| SteamVR auto-start | 부팅 후 매번 `start_vive_stack.sh start` 수동 | systemd-user 단위 등록 가능 (선택) |
+> Each step must pass before moving on. If something fails, jump to §13 troubleshooting.
+
+### J-1. Pre-flight (pro4000)
+
+```bash
+cd ~/Polymetis_Franka_Teleop
+bash install/check_environment.sh
+# All [OK]; [WARN] for things you intentionally don't use is fine; [FAIL] is not.
+```
+
+### J-2. NUC reachability + Polymetis state read (no motion)
+
+```bash
+# (NUC, terminal A)
+sudo bash /usr/local/sbin/start_franka_arm.sh
+# wait for: "Connected." + "[arm pinner] cores 6,7 pin applied"
+
+# (pro4000)
+conda activate groot-client
+python -c "
+from polymetis import RobotInterface
+import numpy as np
+r = RobotInterface(ip_address='192.168.1.12', port=50051)
+s = r.get_robot_state()
+print('joint (deg):', np.degrees(np.asarray(s.joint_positions)))
+"
+# 7 numbers print. Stop with Ctrl-C in the NUC terminal.
+```
+
+### J-3. ZED capture (no robot motion)
+
+```bash
+python ~/Isaac-GR00T/examples/DROID/zed_live_preview.py \
+    --left-sn 33538770 --wrist-sn 11667817
+# Two live windows. q to quit. (Skip if you don't have Isaac-GR00T cloned —
+# zed_live_preview is a small standalone tool, not required by this repo.)
+```
+
+### J-4. ART gripper test
+
+```bash
+# Quickest: poke the daemon directly via the python client
+python -c "
+from art_gripper_client import ArtGripperClient
+c = ArtGripperClient(ip='127.0.0.1', port=50053)
+c.connect()
+print('width m:', c.get_width())
+c.goto(width=0.0, speed=0.05, force=10)   # close
+import time; time.sleep(1.5)
+c.goto(width=0.10, speed=0.05, force=10)  # open
+time.sleep(1.5)
+c.disconnect()
+"
+```
+
+### J-5. Vive pose read
+
+```bash
+# vive_stack already up from §I-4
+python -c "
+from polymetis_franka_teleop.real_world.vive_shared_memory import ViveSharedMemory
+import multiprocessing as mp, time
+m = mp.Manager(); shm = ViveSharedMemory(m, host='127.0.0.1', port=12345)
+shm.start(); time.sleep(1.0)
+print(shm.read_latest_pose())
+shm.stop()
+"
+# Expect a pose dict with controller pos/quat + buttons.
+```
+
+### J-6. Smallest possible joint motion (e-stop in hand!)
+
+```bash
+python <<'PY'
+import torch, numpy as np
+from polymetis import RobotInterface
+r = RobotInterface(ip_address="192.168.1.12", port=50051)
+ready = torch.tensor([0.0, -np.pi/4, 0.0, -3*np.pi/4, 0.0, np.pi/2, np.pi/4])
+r.move_to_joint_positions(ready, time_to_go=4.0)
+print('ready')
+PY
+```
+
+### J-7. Full data collection (everything together)
+
+```bash
+bash bin/start_teleop.sh ~/Polymetis_Franka_Teleop/data/$(date +%Y%m%d_%H%M%S)
+# In the cv2 window: press 'c' to start an episode, 's' to stop, 'q' to quit.
+# Vive: Grip = clutch, Trigger = gripper toggle, Trackpad press = HOME.
+```
+
+When you stop, validate the recording:
+
+```bash
+python examples/check_recording.py data/<your-run-dir>
+# Expect: per-stream shape print, video FPS report, monotonic timestamps
+```
 
 ---
 
-## 참고
+## 13. Troubleshooting catalog
 
-- [Polymetis docs](https://facebookresearch.github.io/fairo/polymetis/overview.html)
-- [libfranka FCI](https://frankarobotics.github.io/docs/libfranka.html)
-- [Stanford UMI](https://github.com/real-stanford/universal_manipulation_interface)
-- 자매 repo (KIST 동일 NUC 사용): `Isaac-GR00T/INSTALL_FROM_SCRATCH.md`, `Isaac-GR00T/KIST_USAGE.md`
-- 자매 repo (ART gripper 자체 셋업): `Hyundai_motors_Gripper/README.md`
+The full list lives in [`docs/troubleshooting.md`](troubleshooting.md). Highlights:
+
+| # | Symptom | Likely cause | Fix |
+|---|---|---|---|
+| 1 | `motion aborted by reflex! [communication_constraints_violation] success_rate: 0.79` | NIC IRQ on P-core competing with GUI | §D — `franka_rt_apply.sh` re-pins NIC IRQ to E-cores |
+| 2 | `success_rate: 0.24` (worse) | RT threads not pinned to cores 6,7 | §D — `start_franka_arm.sh` schedules `franka_pin_helper.sh` |
+| 3 | Recovery cascade (8–12 trips/min during teleop) | IK silent failure when Vive target is unreachable | This repo's `franka_interpolation_controller.py` falls back to `last_good_joint_target` (no fix needed beyond pulling current code) |
+| 4 | `c` key doesn't start recording inside the cv2 window | Old launcher had no signal relay | `bin/cv2_viewer.py` (this repo) sends SIGUSR1/2 + SIGHUP to the demo PID |
+| 5 | `??? IDLE` garbled banners in cv2 window | Em-dash (Unicode) in `cv2.putText` | This repo uses ASCII colons only |
+| 6 | `libtorchscript_pinocchio.so: cannot open` on pro4000 | NUC build artifact not on pro4000 | rsync `~/fairo/polymetis/build/torch_isolation/` from NUC; see Isaac-GR00T INSTALL_FROM_SCRATCH §9-5 |
+| 7 | `curl: libcrypto.so.1.1` after activating `groot-client` | nuc_libs has libcrypto removed but LD_LIBRARY_PATH still points there | `env -u LD_LIBRARY_PATH curl …` or `conda deactivate` first |
+| 8 | ZED 2i UVC missing (HID only) | USB 2.0 cable | Replace with USB 3.0 SuperSpeed C-C |
+| 9 | ZED open `CALIBRATION FILE NOT AVAILABLE` | Calibration not on disk + ZED's libcurl can't fetch with conda LD overrides | §F-2 — pre-download calibration |
+| 10 | Vive trackpad HOME does nothing | `last_teleop_cmd` stale across HOME | This repo's `art_gripper_controller.py` has the explicit reset (no fix needed in current code) |
+| 11 | Franka Desk shows EE as "(none)" / FCI greyed out | Franka Hand connector not seated | Re-seat the EE connector + power-cycle controller box |
+| 12 | NUC `start_franka_arm.sh` runs but no pin message | sudoers drop-in not installed | `sudo bash install/install_nuc.sh` again |
+
+---
+
+## Sister repos
+
+This repo intentionally stays small. Related KIST workspaces:
+
+| Repo | Provides | Used by this repo |
+|---|---|---|
+| [`Hyundai_motors_Gripper`](https://github.com/Seung-Sub/Hyundai_motors_Gripper) | ART gripper EtherCAT daemon + Python client | systemd `art-gripper-daemon` on pro4000 + `art_gripper_client` import |
+| [`Isaac-GR00T`](https://github.com/Seung-Sub/Isaac-GR00T) | GR00T model + DROID inference + `vive_input` C++ binary source | NUC RT setup is shared (literally the same scripts in §D) |
+| [`diffusion_policy`](https://github.com/columbia-ai-robotics/diffusion_policy) | UMI ReplayBuffer + checkpoint loader | `eval_franka_policy.py` and the UMI Zarr converter |
+
+---
+
+Document version: 2026-05-07 (full self-contained Phase A→J; install scripts shipped under `install/nuc/`)

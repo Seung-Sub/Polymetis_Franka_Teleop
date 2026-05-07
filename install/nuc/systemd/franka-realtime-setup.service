@@ -1,0 +1,28 @@
+[Unit]
+Description=Franka realtime sysctl knobs (PCIe ASPM L1, scheduler RT, NMI watchdog)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Disable PCIe ASPM L1 on the NIC PCIe device (replace with your PCI BDF
+# if not enp86s0; the BDF below is KIST i7-1360P specific).
+ExecStart=/bin/bash -c 'echo 0 > /sys/bus/pci/devices/0000:56:00.0/link/l1_aspm 2>/dev/null || true'
+
+# Disable kernel RT throttling (default = 950000us / 1000000us)
+ExecStart=/sbin/sysctl -w kernel.sched_rt_runtime_us=-1
+
+# Disable NMI watchdog (frees one timer per CPU, removes a periodic IPI)
+ExecStart=/sbin/sysctl -w kernel.nmi_watchdog=0
+
+# Disable timer migration so isolated cores keep their own timers
+ExecStart=/sbin/sysctl -w kernel.timer_migration=0
+
+# TCP low-latency knobs for the FCI link
+ExecStart=/sbin/sysctl -w net.ipv4.tcp_low_latency=1
+ExecStart=/sbin/sysctl -w net.core.busy_poll=50
+ExecStart=/sbin/sysctl -w net.core.busy_read=50
+
+[Install]
+WantedBy=multi-user.target
