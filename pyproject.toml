@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymetis_franka_teleop"
+version = "0.1.0"
+description = "KIST Franka teleoperation + data collection (Polymetis-based, ROS-free) — Vive teleop, ZED + ART gripper, GR00T-LeRobot / UMI / Diffusion-Policy compatible output"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "KIST", email = "knykist@kist.re.kr"}]
+
+# Runtime deps the package itself uses. Heavy deps (zerorpc/Vive/ZED SDK/
+# diffusion_policy/torch) are expected to come from the surrounding
+# conda env (e.g. `groot-client`) — listed here for reference only.
+dependencies = [
+  "numpy", "scipy", "click", "opencv-python", "pyzmq",
+  "av", "imageio", "tqdm", "zarr<3", "threadpoolctl",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["polymetis_franka_teleop*"]
+exclude = ["data*", "calibration_results*", "docs*", "scripts_real*"]

@@ -1,0 +1,26 @@
+# Data + artefacts
+data/
+calibration_results/
+*.zarr/
+*.zarr.zip
+*.mp4
+
+# Python build/install
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+logs/
+nohup.out
