@@ -264,7 +264,3 @@ This workspace depends on (and stays consistent with) two adjacent KIST repos �
 |---|---|---|
 | [`Hyundai_motors_Gripper`](https://github.com/Seung-Sub/Hyundai_motors_Gripper) | ART gripper EtherCAT daemon + Python client | `art_gripper_client` library import, daemon runs as systemd on pro4000 |
 | `Isaac-GR00T` (your fork) | GR00T model + DROID inference + Vive_input source | NUC RT setup is shared (see `docs/install_from_scratch.md` §1), Vive_input C++ binary reused from `~/Isaac-GR00T/vive_input/build/` |
-
-## License
-
-MIT — see [LICENSE](LICENSE). Portions adapted from Stanford UMI under the same license.
