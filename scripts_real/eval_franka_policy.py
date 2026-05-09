@@ -214,10 +214,9 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--input', '-i', required=True, help='Path to checkpoint (.ckpt file or directory)')
 @click.option('--output', '-o', required=True, help='Directory to save evaluation recordings')
 @click.option('--robot_ip', default='192.168.1.12', help='Robot NUC IP address (KIST default)')
-@click.option('--robot_port', default=50051, help='NUC port (50051 polymetis-direct, default; 4242 ZeroRPC bridge)')
-@click.option('--polymetis_mode', default='direct', type=click.Choice(['direct', 'zerorpc']),
-              help='direct=raw polymetis :50051 (default); zerorpc=UMI/DROID bridge :4242 (opt-in)')
-@click.option('--gripper_port', default=4242, help='Gripper ZeroRPC port (usually same as robot)')
+@click.option('--robot_port', default=50051, help='Polymetis arm gRPC port (NUC)')
+@click.option('--gripper_port', default=4242, type=int,
+              help='Franka Hand polymetis service port (zerorpc :4242). Ignored for ART backend.')
 @click.option('--camera_backend', default='zed', type=click.Choice(['zed', 'realsense']),
               help='Camera backend (default: zed)')
 @click.option('--gripper_backend', default='art', type=click.Choice(['art', 'franka']),
@@ -244,7 +243,7 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--auto_start', is_flag=True, default=False,
               help='Automatically start policy execution (skip waiting for C key)')
 @click.option('--verbose', '-v', is_flag=True, default=False, help='Enable verbose output')
-def main(input, output, robot_ip, robot_port, polymetis_mode, gripper_port,
+def main(input, output, robot_ip, robot_port, gripper_port,
          camera_backend, gripper_backend, art_gripper_host, art_gripper_port,
          camera_serials, camera_resolution, camera_fps,
          vis_camera_idx, frequency, steps_per_inference,
@@ -309,7 +308,6 @@ def main(input, output, robot_ip, robot_port, polymetis_mode, gripper_port,
                 output_dir=output,
                 robot_ip=robot_ip,
                 robot_port=robot_port,
-                polymetis_mode=polymetis_mode,
                 gripper_port=gripper_port,
                 frequency=frequency,
                 camera_backend=camera_backend,
@@ -325,12 +323,16 @@ def main(input, output, robot_ip, robot_port, polymetis_mode, gripper_port,
                 camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
                 robot_obs_horizon=cfg.task.shape_meta.obs.robot0_eef_pos.horizon,
                 gripper_obs_horizon=cfg.task.shape_meta.obs.robot0_gripper_width.horizon,
-                # Latency settings (measured values)
-                camera_obs_latency=0.015,   # Keep consistent with training data
-                robot_obs_latency=0.001,    # Keep consistent with training data
-                gripper_obs_latency=0.001,  # Keep consistent with training data
-                robot_action_latency=0.055,   # Measured: 54.1ms ± 3.3ms (schedule_waypoint → arrival)
-                gripper_action_latency=0.085, # v2.1 Measured: mean=84.5ms, range=63-100ms (direct command via ZeroRPC)
+                # Latency settings: pass None so FrankaPolicyEnv resolves them
+                # from install/latency_calibration.json (per-backend calibrated
+                # values), with the V3 hardcoded fallback in latency_config.py
+                # if the JSON is absent. Override here only if you need to
+                # match a specific training distribution.
+                camera_obs_latency=None,
+                robot_obs_latency=None,
+                gripper_obs_latency=None,
+                robot_action_latency=None,
+                gripper_action_latency=None,
                 # Robot params
                 tcp_offset=tcp_offset,
                 enable_multi_cam_vis=False,  # Disabled to avoid pickle issues with spawn
