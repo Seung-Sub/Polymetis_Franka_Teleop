@@ -310,6 +310,34 @@ class FrankaInterface:
                 self.robot.update_desired_joint_positions(self._last_good_joint_target)
             return
         self._ik_fail_streak = 0
+        # Joint-velocity clamp BEFORE sending to polymetis (catalog #35).
+        # libfranka's safety_controller fires "joint_velocity_violation" when
+        # |delta_q / dt| exceeds Franka's per-joint velocity limit. The pre-
+        # vious code path sent IK output unchanged, so a fast Vive motion ->
+        # large delta_q -> reflex. Pre-clamping the commanded delta-q to
+        # 2.0 rad/s causes the robot to lag slightly under fast Vive moves
+        # (smooth tracking) instead of triggering a reflex. The dt assumed
+        # is 10 ms (100 Hz teleop) which is what FrankaInterpolationController
+        # actually runs at; using a slightly conservative 8 ms = 0.016 rad/cmd
+        # gives more headroom against per-iter jitter.
+        try:
+            import torch as _torch
+            q_now = self._cached_q if self._cached_q is not None \
+                else self.robot.get_joint_positions()
+            dq = (joint_target - q_now).numpy() if hasattr(joint_target, 'numpy') \
+                else np.asarray(joint_target) - np.asarray(q_now)
+            max_dq = 0.016   # 2.0 rad/s * 8 ms
+            mx = float(np.max(np.abs(dq)))
+            if mx > max_dq:
+                scale = max_dq / mx
+                dq_clamped = dq * scale
+                joint_target = (
+                    _torch.as_tensor(np.asarray(q_now) + dq_clamped, dtype=_torch.float32)
+                )
+        except Exception:
+            # If anything goes wrong (shape/dtype), fall back to unclamped.
+            # No-op exception path keeps the original behaviour as a safety net.
+            pass
         self._last_good_joint_target = joint_target
         self.robot.update_desired_joint_positions(joint_target)
 
