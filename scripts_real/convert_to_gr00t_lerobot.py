@@ -156,17 +156,21 @@ def _write_info_json(out_meta_dir: Path, total_episodes: int, total_frames: int,
     (out_meta_dir / 'info.json').write_text(json.dumps(info, indent=2))
 
 
-def _write_tasks_jsonl(out_meta_dir: Path, task_text: str):
+def _write_tasks_jsonl(out_meta_dir: Path, unique_tasks: list[str]):
+    """Write one row per unique task."""
     with (out_meta_dir / 'tasks.jsonl').open('w') as f:
-        f.write(json.dumps({'task_index': 0, 'task': task_text}) + '\n')
+        for i, t in enumerate(unique_tasks):
+            f.write(json.dumps({'task_index': i, 'task': t}) + '\n')
 
 
-def _write_episodes_jsonl(out_meta_dir: Path, episode_lengths: list[int], task_text: str):
+def _write_episodes_jsonl(out_meta_dir: Path, episode_lengths: list[int],
+                          per_episode_tasks: list[str]):
+    """Write one row per episode with that episode's task string."""
     with (out_meta_dir / 'episodes.jsonl').open('w') as f:
-        for i, n in enumerate(episode_lengths):
+        for i, (n, t) in enumerate(zip(episode_lengths, per_episode_tasks)):
             f.write(json.dumps({
                 'episode_index': i,
-                'tasks': [task_text],
+                'tasks': [t],
                 'length': int(n),
             }) + '\n')
 
@@ -174,10 +178,19 @@ def _write_episodes_jsonl(out_meta_dir: Path, episode_lengths: list[int], task_t
 @click.command()
 @click.option('--input', '-i', required=True, help='Input directory from demo_franka_vive.py')
 @click.option('--output', '-o', required=True, help='Output GR00T-LeRobot v2 dataset directory')
-@click.option('--task', '-t', required=True, help='Task instruction (one string for all episodes)')
-@click.option('--gripper_max_width', default=0.100, type=float,
-              help='Gripper full-open width in meters (0.080 Franka Hand, 0.100 ART)')
-@click.option('--fps', default=10, type=int, help='Recording frequency (=demo --frequency)')
+@click.option('--task', '-t', default=None,
+              help='Task instruction. If omitted, falls back to per-episode '
+                   'tasks recorded in zarr meta (set during demo_franka_vive '
+                   'via env.start_episode(task=...)). One of (CLI --task, '
+                   'zarr meta/episode_tasks) must be present.')
+@click.option('--gripper_max_width', default=None, type=float,
+              help='Gripper full-open width in meters. If omitted, read from '
+                   'zarr meta/.attrs[gripper_max_width] (recorded at collection '
+                   'time). CLI value, if given, overrides the zarr meta.')
+@click.option('--fps', default=None, type=int,
+              help='Dataset frequency. If omitted, read from zarr meta/'
+                   '.attrs[frequency] (recorded at collection time). DROID '
+                   'baseline = 15; UMI/Diffusion-Policy baseline = 10.')
 @click.option('--video_keys', multiple=True,
               default=['exterior_image_1_left', 'wrist_image_left'],
               help='GR00T video keys in camera-index order')
@@ -202,7 +215,55 @@ def main(input, output, task, gripper_max_width, fps, video_keys, copy_videos):
     (out_dir / 'meta').mkdir(parents=True, exist_ok=True)
 
     replay = zarr.open(str(in_zarr), mode='r')
+    # === Resolve config: zarr meta first, CLI overrides if explicitly given ===
+    meta_attrs = dict(replay['meta'].attrs)
+    if gripper_max_width is None:
+        gripper_max_width = float(meta_attrs.get('gripper_max_width', 0.100))
+        print(f'[convert] gripper_max_width = {gripper_max_width:.4f} (from zarr meta)')
+    else:
+        print(f'[convert] gripper_max_width = {gripper_max_width:.4f} (CLI override)')
+    if fps is None:
+        fps = int(meta_attrs.get('frequency', 10))
+        print(f'[convert] fps = {fps} (from zarr meta)')
+    else:
+        print(f'[convert] fps = {fps} (CLI override)')
+    # Optional sanity: warn if data_format flag in zarr disagrees with the
+    # implied target of this script (groot fine-tune dataset).
+    rec_fmt = meta_attrs.get('data_format')
+    if rec_fmt is not None and rec_fmt != 'groot':
+        print(f"[convert] WARN: zarr meta data_format='{rec_fmt}' but this "
+              f"converter targets the 'groot' embodiment. Dataset will still "
+              f"be produced but action / latency conventions may not be "
+              f"optimal. Re-record with --data_format groot for best results.")
+    # Episode tasks: per-episode list from zarr meta (preferred), CLI fallback
+    episode_tasks_meta = list(meta_attrs.get('episode_tasks', []))
     episode_ends = replay['meta']['episode_ends'][:]
+    n_eps_input = len(episode_ends)
+    if episode_tasks_meta and len(episode_tasks_meta) == n_eps_input:
+        per_episode_tasks = list(episode_tasks_meta)
+        print(f'[convert] using per-episode tasks from zarr meta '
+              f'({n_eps_input} entries, {len(set(per_episode_tasks))} unique)')
+    elif episode_tasks_meta and len(episode_tasks_meta) != n_eps_input:
+        raise SystemExit(
+            f'[convert] zarr meta has {len(episode_tasks_meta)} episode_tasks '
+            f'but {n_eps_input} episodes recorded -- recording was inconsistent. '
+            f'Pass --task to override.')
+    elif task is not None:
+        per_episode_tasks = [task] * n_eps_input
+        print(f'[convert] using single CLI --task for all {n_eps_input} episodes')
+    else:
+        raise SystemExit(
+            '[convert] no task instruction available -- pass --task, or '
+            'pre-record per-episode tasks via env.start_episode(task=...)')
+    # Build deduped task -> index
+    unique_tasks: list[str] = []
+    task_to_idx: dict[str, int] = {}
+    for t in per_episode_tasks:
+        if t not in task_to_idx:
+            task_to_idx[t] = len(unique_tasks)
+            unique_tasks.append(t)
+    ep_to_task_idx = [task_to_idx[t] for t in per_episode_tasks]
+
     state_full, action_full = _build_state_action(replay, gripper_max_width)
     timestamps = replay['data']['timestamp'][:]
 
@@ -233,7 +294,7 @@ def main(input, output, task, gripper_max_width, fps, video_keys, copy_videos):
             'observation.state': list(state_full[s:e].astype(np.float32)),
             'action': list(action_full[s:e].astype(np.float32)),
             'timestamp': timestamps[s:e].astype(np.float64),
-            'task_index': np.zeros(n, dtype=np.int64),
+            'task_index': np.full(n, ep_to_task_idx[ep_idx], dtype=np.int64),
             'frame_index': np.arange(n, dtype=np.int64),
             'episode_index': np.full(n, ep_idx, dtype=np.int64),
             'index': np.arange(s, e, dtype=np.int64),
@@ -267,8 +328,8 @@ def main(input, output, task, gripper_max_width, fps, video_keys, copy_videos):
     out_meta = out_dir / 'meta'
     _write_info_json(out_meta, total_episodes, total_frames, fps, n_cameras, image_hw)
     _write_modality_json(out_meta, n_cameras)
-    _write_tasks_jsonl(out_meta, task)
-    _write_episodes_jsonl(out_meta, episode_lengths, task)
+    _write_tasks_jsonl(out_meta, unique_tasks)
+    _write_episodes_jsonl(out_meta, episode_lengths, per_episode_tasks)
 
     print(f'[convert] OK — {total_episodes} episodes, {total_frames} frames')
     print(f'[convert] embodiment-tag suggestion: OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT')

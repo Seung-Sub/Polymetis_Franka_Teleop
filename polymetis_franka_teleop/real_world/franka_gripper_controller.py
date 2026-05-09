@@ -104,7 +104,7 @@ class FrankaGripperController(mp.Process):
             shm_manager: SharedMemoryManager,
             robot_ip: str,
             gripper_port: int = 4242,
-            frequency: int = 30,
+            frequency: int = 60,
             move_max_speed: float = 0.2,
             get_max_k: int = None,
             command_queue_size: int = 1024,
@@ -330,6 +330,7 @@ class FrankaGripperController(mp.Process):
             keep_running = True
             t_start = time.monotonic()
             iter_idx = 0
+            overrun_count = 0  # iters where precise_wait was already past t_end
 
             # Teleop mode state
             last_teleop_timestamp = 0.0
@@ -538,7 +539,14 @@ class FrankaGripperController(mp.Process):
 
                 # Regulate frequency
                 t_end = t_start + dt * iter_idx
+                if time.monotonic() > t_end:
+                    overrun_count += 1
                 precise_wait(t_end=t_end, time_func=time.monotonic)
+                if self.verbose and iter_idx % (self.frequency * 5) == 0:
+                    # every ~5 s, report loop health
+                    print(f"[FrankaGripperController] iter={iter_idx} target={self.frequency}Hz "
+                          f"overruns={overrun_count}/{self.frequency * 5} (last 5s)")
+                    overrun_count = 0
 
         except ImportError as e:
             print(f"[FrankaGripperController] Failed to import zerorpc: {e}")

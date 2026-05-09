@@ -60,7 +60,7 @@ class ArtGripperController(mp.Process):
             shm_manager: SharedMemoryManager,
             host: str = "127.0.0.1",
             port: int = 50053,
-            frequency: int = 30,
+            frequency: int = 60,
             move_max_speed: float = 0.15,
             default_force: float = 30.0,
             get_max_k: int = None,
@@ -239,6 +239,7 @@ class ArtGripperController(mp.Process):
             t_start = time.monotonic()
             iter_idx = 0
             dt = 1 / self.frequency
+            overrun_count = 0  # iters where precise_wait was already past t_end
 
             while keep_running:
                 t_now = time.monotonic()
@@ -441,7 +442,16 @@ class ArtGripperController(mp.Process):
                 if iter_idx == 0:
                     self.ready_event.set()
                 iter_idx += 1
-                precise_wait(t_end=t_start + dt * iter_idx, time_func=time.monotonic)
+                t_end = t_start + dt * iter_idx
+                if time.monotonic() > t_end:
+                    overrun_count += 1
+                precise_wait(t_end=t_end, time_func=time.monotonic)
+                if self.verbose and iter_idx % (self.frequency * 5) == 0:
+                    # every ~5 s, report loop health
+                    print(f"[ArtGripperController] iter={iter_idx} target={self.frequency}Hz "
+                          f"overruns={overrun_count}/{self.frequency * 5} "
+                          f"(last 5s)")
+                    overrun_count = 0
 
         except Exception as e:
             print(f"[ArtGripperController] fatal: {e}")

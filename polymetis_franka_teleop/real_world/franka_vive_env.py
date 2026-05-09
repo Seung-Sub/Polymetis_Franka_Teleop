@@ -122,12 +122,15 @@ class FrankaViveEnv:
             max_obs_buffer_size=60,
             obs_float32=False,
             # timing (all in seconds)
-            # Latency values calibrated via V3 direct measurement (2026-01-25)
-            # See scripts_real/LATENCY_CALIBRATION_GUIDE.md for details
+            # Latency values default to install/latency_calibration.json (or to
+            # the V3 2026-01-25 hardcoded fallback if the JSON is missing).
+            # Pass an explicit value here to override per-call. Backend-aware
+            # resolution happens below after camera_backend / gripper_backend
+            # are known.
             align_camera_idx=0,  # Which camera's timestamp to use as reference
-            camera_obs_latency=0.015,   # V3 HW timestamp (was: 0.125)
-            robot_obs_latency=0.001,    # V3 round-trip/2 (was: 0.0001)
-            gripper_obs_latency=0.001,  # V3 round-trip/2 (was: 0.01)
+            camera_obs_latency=None,
+            robot_obs_latency=None,
+            gripper_obs_latency=None,
             # all in steps (relative to frequency)
             camera_down_sample_steps=1,
             robot_down_sample_steps=1,
@@ -212,6 +215,19 @@ class FrankaViveEnv:
                 grip_force = 30.0
 
         # Resolve ready pose from data_format + gripper_backend if not explicitly given.
+        # Resolve latency constants early so sub-controllers (gripper, etc.)
+        # can be constructed with the right ``receive_latency``. JSON config
+        # > explicit kwarg > backend-specific fallback.
+        from polymetis_franka_teleop.common.latency_config import (
+            get_camera_obs_latency, get_robot_obs_latency, get_gripper_obs_latency,
+        )
+        if camera_obs_latency is None:
+            camera_obs_latency = get_camera_obs_latency(camera_backend)
+        if robot_obs_latency is None:
+            robot_obs_latency = get_robot_obs_latency()
+        if gripper_obs_latency is None:
+            gripper_obs_latency = get_gripper_obs_latency(gripper_backend)
+
         # ``ready_pose`` is the canonical home for both trackpad-HOME and (when
         # auto_home_on_start) the controller's startup move-to.
         if init_joints is None:
@@ -399,7 +415,7 @@ class FrankaViveEnv:
                 shm_manager=shm_manager,
                 host=art_gripper_host,
                 port=art_gripper_port,
-                frequency=30,
+                frequency=60,  # raised from 30 to match camera 60 fps; ART daemon PDO 100Hz handles this comfortably
                 verbose=verbose,
                 receive_latency=gripper_obs_latency,
                 teleop_mode=True,
@@ -413,7 +429,7 @@ class FrankaViveEnv:
                 shm_manager=shm_manager,
                 robot_ip=robot_ip,
                 gripper_port=gripper_port,
-                frequency=30,
+                frequency=60,  # raised from 30; libfranka commands stay rate-limited via transition-only logic, but state polling at 60 Hz aligns with camera
                 verbose=verbose,
                 receive_latency=gripper_obs_latency,
                 teleop_mode=True,
@@ -441,7 +457,7 @@ class FrankaViveEnv:
         self.max_obs_buffer_size = max_obs_buffer_size
         self.verbose = verbose
 
-        # Timing parameters
+        # Timing parameters — already resolved at top of __init__
         self.align_camera_idx = align_camera_idx
         self.camera_obs_latency = camera_obs_latency
         self.robot_obs_latency = robot_obs_latency
@@ -470,6 +486,42 @@ class FrankaViveEnv:
         # Used when clutch is inactive or during HOME motion
         self._last_robot_obs_pose = None
         self._last_gripper_obs_width = None
+
+        # Write recording-time config to the zarr meta. The converters
+        # (convert_to_gr00t_lerobot, convert_franka_vive_to_umi_format) read
+        # these so the user can't accidentally pass mismatched
+        # --gripper_max_width / --fps / --data_format at conversion time.
+        self._write_recording_meta()
+
+    def _write_recording_meta(self):
+        """Persist data-collection config into replay_buffer.zarr/meta/.attrs.
+
+        Idempotent — overwrites on every __init__. Stored as a JSON-serializable
+        dict so that converters can `zarr.open(...).require_group("meta").attrs`.
+        """
+        try:
+            import zarr
+            zarr_path = str(self.output_dir.joinpath('replay_buffer.zarr').absolute())
+            root = zarr.open(zarr_path, mode='a')
+            meta = root.require_group('meta')
+            cfg = {
+                'data_format': self.data_format,
+                'gripper_backend': self.gripper_backend,
+                'camera_backend': self.camera_backend,
+                'frequency': int(self.frequency),
+                'gripper_max_width': float(self.gripper.gripper_open_width),
+                'gripper_close_width': float(getattr(self.gripper, 'gripper_close_width', 0.0)),
+                # Latency constants in effect at record time (so post-hoc
+                # latency analysis can use the right reference values).
+                'camera_obs_latency': float(self.camera_obs_latency),
+                'robot_obs_latency': float(self.robot_obs_latency),
+                'gripper_obs_latency': float(self.gripper_obs_latency),
+            }
+            for k, v in cfg.items():
+                meta.attrs[k] = v
+        except Exception as e:
+            # never block recording on a meta-write failure
+            print(f"[FrankaViveEnv] WARN: could not write zarr meta config: {e}")
 
     # ======== Start/Stop API =============
     @property
@@ -877,8 +929,29 @@ class FrankaViveEnv:
             print("[FrankaViveEnv] HOME complete. Re-engage clutch (grip) to continue teleop.")
 
     # ========= Recording API =============
-    def start_episode(self, start_time=None):
-        """Start recording an episode."""
+    def start_episode(self, start_time=None, task=None):
+        """Start recording an episode.
+
+        Args:
+            start_time: optional float wall-clock anchor (defaults to now).
+            task: optional language instruction for this episode. If provided,
+                  it is appended to ``replay_buffer.zarr/meta/.attrs['episode_tasks']``
+                  (a list parallel to episode_ends). Converters use this to
+                  populate the per-episode ``tasks`` field of the LeRobot
+                  dataset, eliminating the need to pass ``--task`` at
+                  conversion time.
+        """
+        if task is not None:
+            try:
+                import zarr
+                zarr_path = str(self.output_dir.joinpath('replay_buffer.zarr').absolute())
+                root = zarr.open(zarr_path, mode='a')
+                meta = root.require_group('meta')
+                tasks = list(meta.attrs.get('episode_tasks', []))
+                tasks.append(str(task))
+                meta.attrs['episode_tasks'] = tasks
+            except Exception as e:
+                print(f"[FrankaViveEnv] WARN: could not append episode task: {e}")
         if start_time is None:
             start_time = time.time()
         self.start_time = start_time

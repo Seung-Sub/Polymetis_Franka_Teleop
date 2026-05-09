@@ -112,14 +112,15 @@ class FrankaPolicyEnv:
             obs_image_resolution=(224, 224),
             max_obs_buffer_size=60,
             obs_float32=True,  # For policy inference, typically float32
-            # timing (all in seconds)
+            # timing (all in seconds) — None defers to install/latency_calibration.json
+            # (with V3 2026-01-25 hardcoded fallback inside latency_config.py).
             align_camera_idx=0,
-            camera_obs_latency=0.015,
-            robot_obs_latency=0.001,
-            gripper_obs_latency=0.001,
-            # action latency for compensation (measured via measure_action_latency_v4.py, measure_gripper_direct_latency.py)
-            robot_action_latency=0.055,  # Measured: 54.1ms ± 3.3ms (schedule_waypoint → arrival)
-            gripper_action_latency=0.085,  # v2.1 Measured: mean=84.5ms, range=63-100ms (direct command via ZeroRPC)
+            camera_obs_latency=None,
+            robot_obs_latency=None,
+            gripper_obs_latency=None,
+            # action latency for compensation (None → JSON config / hardcoded fallback)
+            robot_action_latency=None,
+            gripper_action_latency=None,
             # all in steps (relative to frequency)
             camera_down_sample_steps=1,
             robot_down_sample_steps=1,
@@ -140,7 +141,8 @@ class FrankaPolicyEnv:
             gripper_backend='art',
             art_gripper_host='127.0.0.1',
             art_gripper_port=50053,
-            # action latency overrides (will be auto-set per gripper backend if None)
+            # action latency override for ART (used only if gripper_action_latency=None
+            # AND gripper_backend='art' AND no JSON entry — hardcoded last-resort default)
             art_gripper_action_latency=0.085,
             # speed limits
             max_pos_speed=2.0,
@@ -162,7 +164,32 @@ class FrankaPolicyEnv:
         if gripper_backend == 'art':
             if gripper_open_width <= 0.075 + 1e-9:
                 gripper_open_width = 0.095
-            gripper_action_latency = art_gripper_action_latency
+
+        # Resolve latency constants from install/latency_calibration.json (or
+        # hardcoded V3 fallback inside latency_config) when caller passed None.
+        # Explicit kwargs always win.
+        from polymetis_franka_teleop.common.latency_config import (
+            get_camera_obs_latency, get_robot_obs_latency, get_gripper_obs_latency,
+            get_robot_action_latency, get_gripper_action_latency,
+        )
+        if camera_obs_latency is None:
+            camera_obs_latency = get_camera_obs_latency(camera_backend)
+        if robot_obs_latency is None:
+            robot_obs_latency = get_robot_obs_latency()
+        if gripper_obs_latency is None:
+            gripper_obs_latency = get_gripper_obs_latency(gripper_backend)
+        if robot_action_latency is None:
+            robot_action_latency = get_robot_action_latency()
+        if gripper_action_latency is None:
+            gripper_action_latency = get_gripper_action_latency(gripper_backend)
+        # Legacy ART override: if the caller passed art_gripper_action_latency
+        # AND gripper_backend=='art' AND gripper_action_latency wasn't set
+        # explicitly, honour the legacy override path.
+        if gripper_backend == 'art' and art_gripper_action_latency is not None:
+            # Only apply if this kwarg was explicitly set to a non-default-looking value;
+            # otherwise the JSON-resolved value above is preferred.
+            if abs(art_gripper_action_latency - 0.085) > 1e-9:
+                gripper_action_latency = art_gripper_action_latency
 
         output_dir = pathlib.Path(output_dir)
         assert output_dir.parent.is_dir()
@@ -285,7 +312,7 @@ class FrankaPolicyEnv:
                 shm_manager=shm_manager,
                 host=art_gripper_host,
                 port=art_gripper_port,
-                frequency=30,
+                frequency=60,  # raised from 30 to match camera (matches teleop env)
                 verbose=verbose,
                 receive_latency=gripper_obs_latency,
                 teleop_mode=False,
@@ -298,7 +325,7 @@ class FrankaPolicyEnv:
                 shm_manager=shm_manager,
                 robot_ip=robot_ip,
                 gripper_port=gripper_port,
-                frequency=30,
+                frequency=60,  # raised from 30 (matches teleop env)
                 verbose=verbose,
                 receive_latency=gripper_obs_latency,
                 teleop_mode=False,
@@ -359,6 +386,32 @@ class FrankaPolicyEnv:
         self.obs_accumulator = None
         self.action_accumulator = None
         self.start_time = None
+
+        # Persist eval-time config to zarr meta so eval rollouts are
+        # self-describing. Policy eval has no data_format (always runs a
+        # fixed policy ckpt), so that key is omitted.
+        try:
+            import zarr
+            zarr_path = str(self.output_dir.joinpath('replay_buffer.zarr').absolute())
+            root = zarr.open(zarr_path, mode='a')
+            meta = root.require_group('meta')
+            cfg = {
+                'mode': 'policy_eval',
+                'gripper_backend': self.gripper_backend,
+                'camera_backend': self.camera_backend,
+                'frequency': int(self.frequency),
+                'gripper_max_width': float(self.gripper.gripper_open_width),
+                'gripper_close_width': float(getattr(self.gripper, 'gripper_close_width', 0.0)),
+                'camera_obs_latency': float(self.camera_obs_latency),
+                'robot_obs_latency': float(self.robot_obs_latency),
+                'gripper_obs_latency': float(self.gripper_obs_latency),
+                'robot_action_latency': float(self.robot_action_latency),
+                'gripper_action_latency': float(self.gripper_action_latency),
+            }
+            for k, v in cfg.items():
+                meta.attrs[k] = v
+        except Exception as e:
+            print(f"[FrankaPolicyEnv] WARN: could not write zarr meta config: {e}")
 
     # ======== Start/Stop API =============
     @property
