@@ -1,14 +1,14 @@
 # Polymetis_Franka_Teleop
 
-ROS-free Franka Panda teleoperation + data collection workspace, optimised for KIST hardware (NUC + RTX 4000 SFF + ZED 2i/Mini + HTC Vive + ART gripper or Franka Hand).
+ROS-free Franka Panda teleoperation + data collection workspace, built around an HTC Vive controller, a NUC running PREEMPT_RT polymetis, and a workstation running this repo. Records data in formats consumed by GR00T-N1.7-DROID, ACT / generic LeRobot, and Diffusion-Policy / UMI — pick the converter that matches your target model.
 
-The pipeline is forked from [Stanford UMI](https://github.com/real-stanford/universal_manipulation_interface)'s real-robot stack — every timing-critical algorithm (timestamp-aligned obs, 200 Hz interpolation controller, latency-compensated action scheduling, Zarr+H264 storage) is preserved verbatim. KIST-specific changes are confined to the hardware boundary (camera/gripper/teleop drivers).
+The pipeline is forked from [Stanford UMI](https://github.com/real-stanford/universal_manipulation_interface)'s real-robot stack. The timing-critical algorithms (timestamp-aligned obs, 100 Hz interpolation controller, latency-compensated action scheduling, Zarr+H264 storage) are preserved verbatim. KIST-specific changes are confined to the hardware boundary (camera/gripper/teleop drivers) and the post-recording converters.
 
 ## Architecture
 
 ```
 HTC Vive controller
-    │ TCP :12345 (vive_input, ROS-free)
+    │ TCP :12345 (vive_input)
     ▼
 ViveSharedMemory (200 Hz)
     │
@@ -16,260 +16,214 @@ ViveSharedMemory (200 Hz)
 ViveTeleopProcess (100 Hz, clutch + toggle + velocity clamp)
     │ robot_ring_buffer        gripper_ring_buffer       action_ring_buffer
     ▼                          ▼                         ▼
-FrankaInterpolationController  Franka/ArtGripperController   Main loop (10 Hz)
-    │ 100 Hz                    │ 30 Hz (discrete)             │
-    ▼                          ▼                              ├── MultiZed   60 fps H264 MP4
-NUC :50051 polymetis           pro4000 :50053 ART             └── Zarr replay_buffer (per-step state/action)
-   1 kHz libfranka loop          (or NUC :50052 Franka Hand)
+FrankaInterpolationController  Art / FrankaGripperCtrl   Main loop (10 / 15 Hz)
+    │ 100 Hz direct gRPC       │ 60 Hz (discrete)          │
+    ▼                          ▼                            ├── MultiZed / MultiRealsense  60 fps H264 MP4
+NUC :50051 polymetis           pro4000 :50053 ART          └── Zarr replay_buffer
+   1 kHz libfranka loop          (or NUC :4242 Franka Hand)
 ```
 
-Hardware Hz / call-rate decisions are documented in `docs/pipeline.md`.
+Hz / call-rate decisions are documented in [`docs/pipeline.md`](docs/pipeline.md).
+
+## What's modular
+
+The same demo + eval scripts cover a 4-axis backend matrix; pick at the CLI:
+
+| Axis | Choices | CLI flag |
+|---|---|---|
+| Gripper | `art` (Hyundai EtherCAT, default) · `franka` (Franka Hand) | `--gripper_backend` |
+| Camera | `zed` (ZED 2i / Mini, default) · `realsense` (Intel RealSense) | `--camera_backend` |
+| Output format | `groot` · `umi` · `diffusion` (selects ready-pose at startup) | `--data_format` |
+| Frequency | `10` (DP/ACT default) · `15` (GR00T-DROID baseline) | `--frequency` |
+
+The robot-arm transport is direct polymetis gRPC `:50051`. The Franka Hand gripper still uses fairo's standalone zerorpc service `:4242` (intrinsic to the polymetis Franka Hand interface).
 
 ## Documentation
 
 | Doc | What's in it |
 |---|---|
-| [`docs/install_from_scratch.md`](docs/install_from_scratch.md) | Hardware → fully working teleop, Phase A→J, self-contained. NUC RT scripts shipped under [`install/nuc/`](install/nuc/), pro4000 install via [`install/install_pro4000.sh`](install/install_pro4000.sh) |
-| [`docs/usage.md`](docs/usage.md) | Daily TL;DR — once installed, this is the manual |
+| [`docs/install_from_scratch.md`](docs/install_from_scratch.md) | Hardware → working teleop, Phase A→J. NUC RT scripts ship under [`install/nuc/`](install/nuc/), pro4000 scripts under [`install/pro4000/`](install/pro4000/) |
+| [`docs/usage.md`](docs/usage.md) | Per-host phase-by-phase commands, model-specific data-collection workflow |
 | [`docs/pipeline.md`](docs/pipeline.md) | Hz / algorithm deep-dive (UMI controller, latency calibration, timestamp accumulator) |
 | [`docs/hardware_setup.md`](docs/hardware_setup.md) | Networking + cabling cheat sheet |
-| [`docs/teleop_tuning.md`](docs/teleop_tuning.md) | Vive ↔ Franka feel knobs (pos_scale, rot_scale, Kx, Kxd) |
-| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptom → fix catalog |
+| [`docs/teleop_tuning.md`](docs/teleop_tuning.md) | Vive ↔ Franka feel knobs (`pos_scale`, `rot_scale`, Kx, Kxd) |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptom → fix catalog (#25 onwards: stutter / recovery / RT) |
 
-## Hardware (KIST)
+## Hardware (KIST default)
 
 | Role | Where | Notes |
 |---|---|---|
-| Franka Panda + 2-finger ART (or Franka Hand) | bench | Franka Desk → FCI Activate before bring-up |
+| Franka Panda + ART gripper (default) or Franka Hand | bench | Franka Desk → unlock joints + Activate FCI before bring-up |
 | NUC `192.168.1.12` (`kist@kist-NUC13ANHi7`) | wired direct | PREEMPT_RT kernel + RT IRQ pinning (Phase D — `install/nuc/`) |
-| pro4000 (`kist@kist-eval`, `161.122.114.90`) | wired | runs this repo + GR00T workspace + ART daemon |
+| pro4000 (`kist@kist-eval`, `161.122.114.90`) | wired | this repo + GR00T workspace + ART daemon |
 | ART gripper (Hyundai Motors) | EtherCAT NIC `enxb0386cf13036` | systemd `art-gripper-daemon` :50053 (auto-boot) |
 | ZED 2i `33538770` (exterior) | USB | LEFT eye only, 60 fps native VGA (672×376) |
 | ZED Mini `11667817` (wrist) | USB | LEFT eye only |
 | HTC Vive controller | base stations × 2 | SteamVR + `vive_input` TCP :12345 |
 
-## Output formats
+## Output formats and converters
 
-| Variant | Use | Script |
+You collect once and convert to whichever target format you need.
+
+| Target model | Converter | Output |
 |---|---|---|
-| Native UMI Zarr + H264 MP4 | Diffusion Policy / UMI training | `scripts_real/convert_franka_vive_to_umi_format.py` |
-| GR00T LeRobot v2 (DROID embodiment) | `nvidia/GR00T-N1.7-3B` / `nvidia/GR00T-N1.7-DROID` fine-tune | `scripts_real/convert_to_gr00t_lerobot.py` |
+| `nvidia/GR00T-N1.7-3B` / `nvidia/GR00T-N1.7-DROID` | `scripts_real/convert_to_gr00t_lerobot.py` | LeRobot v2.1 with DROID 17-D state/action (eef_9d + gripper + joint) |
+| ACT / HuggingFace LeRobot / generic | `scripts_real/convert_to_lerobot.py` | LeRobot v2.1, raw state/action (`--state_format {joint,eef,full}`) |
+| Diffusion Policy / UMI | `scripts_real/convert_franka_vive_to_umi_format.py` | UMI `dataset.zarr.zip` |
 
-Training itself is out of scope here — fine-tune in `Isaac-GR00T` or your `diffusion_policy` repo and bring the checkpoint back to `eval_franka_policy.py`.
+Training itself is out of scope — fine-tune in [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T), HuggingFace LeRobot (ACT), or your `diffusion_policy` checkout, and bring the resulting checkpoint back to `eval_franka_policy.py`.
 
 ## Install (one-shot per host)
 
 ```bash
-# (NUC) RT scripts + systemd units + sudoers drop-in
+# (NUC) RT scripts + systemd units + sudoers drop-in for franka_pin_helper
 sudo bash install/install_nuc.sh
 
-# (pro4000) groot-client conda env + this repo + ART client
+# (pro4000) base deps + repo install
 bash install/install_pro4000.sh
+sudo bash install/install_pro4000_rt.sh   # RT-tune (rtprio, NIC IRQ, governor)
 ```
 
-Full install walk-through in [`docs/install_from_scratch.md`](docs/install_from_scratch.md) — go there if you have only hardware.
+Full install walk-through in [`docs/install_from_scratch.md`](docs/install_from_scratch.md).
 
-## Bring up the stack (after install)
+## Daily bring-up
 
-Pre-flight: `bash install/check_environment.sh` (each line OK / WARN / FAIL with hints).
+`docs/usage.md` is the manual. Quick reference:
 
 ```bash
-# Franka Desk web UI:  unlock joints + Activate FCI + e-stop released
+# (pro4000) preflight: stale-process kill + ART/ZED/Vive/NUC checks (auto-fix where safe)
+bash bin/preflight_full.sh
 
-# NUC — terminal 1
+# (NUC) terminal (only if not running as systemd)
 ssh kist@192.168.1.12
-sudo bash /usr/local/sbin/start_franka_arm.sh         # polymetis arm :50051
+sudo bash /usr/local/sbin/start_franka_arm.sh           # polymetis arm :50051
+sudo bash /usr/local/sbin/start_franka_gripper.sh       # only for --gripper_backend franka
 
-# NUC — terminal 2 (Franka Hand workflow only — skip for ART)
-sudo bash /usr/local/sbin/start_franka_gripper.sh
+# (pro4000) Vive bring-up
+bash bin/start_vive_stack.sh start
 
-# pro4000 — Vive
-bash ~/Polymetis_Franka_Teleop/bin/start_vive_stack.sh start    # vrserver --keepalive + vive_input
+# (pro4000) collect data — pick the wrapper for your target model
+bash bin/start_teleop_groot_droid_ft.sh ./data/$(date +%Y%m%d_%H%M%S)   # GR00T (15 Hz, DROID ready-pose)
+bash bin/start_teleop.sh                ./data/$(date +%Y%m%d_%H%M%S)   # ACT/DP/UMI (10 Hz, Franka home)
 
-# pro4000 — ART daemon (auto-systemd, just verify)
-systemctl is-active art-gripper-daemon
+# In the cv2 window:
+#   c     start episode    s    stop episode
+#   bksp  drop episode     y    confirm
+#   h     home (alt: trackpad press)
+#   q     quit (double-press within 1.5 s — single press is a no-op)
+# On the controller:
+#   Grip      clutch (hold to drive)
+#   Trigger   gripper toggle
+#   Trackpad  HOME
 ```
 
-Optional **ZeroRPC bridge** mode (UMI/DROID-style — runs polymetis client locally on the NUC, exposes one ZeroRPC endpoint):
-
-```bash
-bash ~/Polymetis_Franka_Teleop/bin/start_unified_bridge_on_nuc.sh   # auto-deploys + launches on NUC
-# then run demo_franka_vive.py with --polymetis_mode zerorpc --robot_port 4242
-```
-
-## Data collection
-
-```bash
-# ART + ZED (KIST default)
-bash bin/start_teleop.sh ~/Polymetis_Franka_Teleop/data/$(date +%Y%m%d_%H%M%S)
-
-# or directly with full CLI control
-python scripts_real/demo_franka_vive.py \
-    --output ./data/pap \
-    --robot_ip 192.168.1.12 \
-    --camera_backend zed --gripper_backend art \
-    --camera_serials 33538770 --camera_serials 11667817 \
-    --camera_resolution 1280x720 --camera_fps 60 \
-    -v
-```
-
-In-app keys: `c` start, `s` stop, `Backspace`+`y` drop, `h` home, `q` quit.
-Vive: `Grip` clutch, `Trigger` gripper toggle, `Trackpad press` HOME.
-
-Drop-in alternatives:
-* `--gripper_backend franka`     — Franka Hand instead of ART (also start `start_franka_gripper.sh` on NUC)
-* `--camera_backend realsense`   — RealSense instead of ZED (legacy UMI)
-* `--polymetis_mode zerorpc --robot_port 4242` — UMI/DROID-style bridge
-* `LIVE_DURATION=60 python examples/run_live_test.py` — 60 s headless live test
-
-Teleop feel: pass `--tuning_preset {coarse|normal|precise|custom}` to switch
-between Vive↔robot mappings and Cartesian impedance gains. See
-[`docs/teleop_tuning.md`](docs/teleop_tuning.md) for the symptom→knob table
-and safe ranges.
+Mid-session monitoring (separate terminal): `bash bin/monitor_session.sh`.
 
 ## Convert recorded data
 
 ```bash
-# UMI / Diffusion Policy
-python scripts_real/convert_franka_vive_to_umi_format.py \
-    -i ./data/pap -o ./data/pap/dataset.zarr.zip -r 224,224
-
-# GR00T LeRobot v2 (DROID embodiment, ready for fine-tune)
+# GR00T-DROID (15 Hz dataset, DROID 17-D)
 python scripts_real/convert_to_gr00t_lerobot.py \
     -i ./data/pap -o ./data/pap_gr00t \
+    -t "Pick up the yellow cup"
+
+# ACT / generic LeRobot (joint-space, 8-D)
+python scripts_real/convert_to_lerobot.py \
+    -i ./data/pap -o ./data/pap_act \
     -t "Pick up the yellow cup" \
-    --gripper_max_width 0.100   # ART: 0.100 ; Franka Hand: 0.080
+    --state_format joint --gripper_repr normalized
+
+# UMI / Diffusion-Policy
+python scripts_real/convert_franka_vive_to_umi_format.py \
+    -i ./data/pap -o ./data/pap/dataset.zarr.zip -r 224,224
 ```
 
-The GR00T export is directly usable:
+`gripper_max_width`, `fps`, and per-episode tasks are read from `replay_buffer.zarr/meta/.attrs` if present (set during recording), so most flags are optional.
+
+## Latency calibration (run once per hardware change)
+
+All per-channel latency constants live in [`install/latency_calibration.json`](install/latency_calibration.json) and are loaded automatically by `FrankaViveEnv` / `FrankaPolicyEnv` (with V3 hardcoded fallback if the file is missing).
 
 ```bash
-cd ~/Isaac-GR00T
-uv run python gr00t/experiment/launch_finetune.py \
-    --base-model-path nvidia/GR00T-N1.7-3B \
-    --dataset-path ~/Polymetis_Franka_Teleop/data/pap_gr00t \
-    --embodiment-tag OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT \
-    --num-gpus 1 --output-dir /tmp/franka_finetune \
-    --max-steps 5000 --global-batch-size 32
-```
-
-## Verify a recording
-
-```bash
-python examples/check_recording.py data/pap
-# Zarr stream shapes + monotonic timestamps + video FPS/decode check + GR00T metadata if converted
-```
-
-## Latency calibration
-
-All per-channel latency constants live in [`install/latency_calibration.json`](install/latency_calibration.json) and are loaded automatically by `FrankaViveEnv` / `FrankaPolicyEnv` at construction time (with hardcoded V3 fallbacks if the file is missing). Backend-aware: the ZED camera and the ART gripper carry their own keys.
-
-Current defaults (V3 2026-01-25, RealSense + Franka Hand calibrated; ZED + ART use placeholder values until the new calibrators are run):
-
-| Channel | Latency | Source |
-|---|---|---|
-| Camera obs (RealSense) | 15 ms | hardware timestamp |
-| Camera obs (ZED) | 15 ms | placeholder — run `calibrate_zed_latency.py` |
-| Robot obs | 1 ms | round-trip / 2 |
-| Gripper obs (Franka) | 1 ms | ZeroRPC round-trip / 2 |
-| Gripper obs (ART) | 1 ms | placeholder — run `calibrate_art_gripper_latency.py` |
-| Robot action | 55 ms | schedule_waypoint → arrival |
-| Gripper action (Franka) | 85 ms | direct ZeroRPC |
-| Gripper action (ART) | 85 ms | placeholder — run `calibrate_art_gripper_latency.py` |
-
-Re-measure on hardware change. Each calibrator prints stats and (with `--patch`, the default) writes the measured value back into `install/latency_calibration.json` so subsequent recordings pick it up automatically:
-
-```bash
-# Existing (Franka Hand + RealSense paths)
-python scripts_real/calibrate_franka_robot_latency.py
-python scripts_real/calibrate_franka_gripper_latency.py
-python scripts_real/calibrate_realsense_latency.py
-python scripts_real/calibrate_all_latencies.py        # orchestrator
-
-# NEW for ZED + ART (KIST-specific paths)
+python scripts_real/calibrate_franka_arm_direct.py    # arm via :50051
 python scripts_real/calibrate_zed_latency.py --serial 33538770 --serial 11667817
-python scripts_real/calibrate_art_gripper_latency.py
+python scripts_real/calibrate_art_gripper_latency.py  # ART daemon :50053
 ```
+
+Each calibrator prints stats and writes back to `install/latency_calibration.json`. If you wire up the Franka Hand backend instead of ART, copy `calibrate_art_gripper_latency.py` as a template — the protocol is different but the floor-offset measurement methodology is the same.
 
 ## Policy eval
 
+Loads a trained checkpoint, runs inference at the recorded frequency, executes via the same controller stack, and records into the same Zarr+MP4 format as data collection. Latencies are compensated automatically from `install/latency_calibration.json`, so the action timestamps match the training distribution.
+
 ```bash
-bash bin/start_eval.sh path/to/checkpoint.ckpt ~/Polymetis_Franka_Teleop/data/eval_$(date +%H%M%S)
+bash bin/start_eval.sh path/to/checkpoint.ckpt ./data/eval_$(date +%H%M%S)
 ```
 
-Loads a Diffusion Policy checkpoint, runs inference at 10 Hz, executes via the same controller stack, and records into the same Zarr+MP4 format as data collection.
-
-For GR00T evaluation, use the existing GR00T server-client setup in `Isaac-GR00T/examples/DROID/main_gr00t.py` (this repo's `eval_franka_policy.py` is targeted at local diffusion-policy checkpoints).
+For GR00T evaluation, the inference path is the GR00T server-client setup in `Isaac-GR00T/examples/DROID/main_gr00t.py` (this repo's `eval_franka_policy.py` targets local diffusion-policy and HF-LeRobot checkpoints).
 
 ## Repository layout
 
 ```
 Polymetis_Franka_Teleop/
-├── README.md                             ← you are here
-├── LICENSE                               ← MIT (UMI portions also MIT)
-├── pyproject.toml                        ← pip install -e .
-├── docs/
-│   ├── install_from_scratch.md           ← Phase A→J full install (hardware → working teleop)
-│   ├── usage.md                          ← daily TL;DR
-│   ├── pipeline.md                       ← Hz/algorithm deep-dive
-│   ├── hardware_setup.md                 ← network + cabling
-│   ├── teleop_tuning.md                  ← Vive ↔ Franka feel knobs
-│   └── troubleshooting.md                ← symptom → fix catalog
+├── README.md                                 ← you are here
+├── LICENSE                                   ← MIT (UMI portions also MIT)
+├── pyproject.toml                            ← pip install -e .
+├── docs/                                     (install / usage / troubleshooting / ...)
 ├── install/
-│   ├── check_environment.sh              ← preflight dependency check
-│   ├── install_nuc.sh                    ← (NUC) copies install/nuc/* into /usr/local/sbin etc.
-│   ├── install_pro4000.sh                ← (pro4000) groot-client conda env + this repo
-│   └── nuc/                              ← raw RT scripts + systemd units shipped with the repo
-│       ├── README.md                     ← what each file does, manual prereqs
-│       ├── sbin/franka_rt_apply.sh        # boot-time NIC IRQ pin / governor / ASPM / Turbo
-│       ├── sbin/franka_dma_latency.py     # /dev/cpu_dma_latency 0us holder
-│       ├── sbin/franka_pin_helper.sh      # post-launch taskset of polymetis RT threads to 6,7
-│       ├── sbin/start_franka_arm.sh       # polymetis arm wrapper (auto pin)
-│       ├── sbin/start_franka_gripper.sh   # polymetis franka_hand wrapper
-│       ├── systemd/franka-rt-tune.service       # boot-time franka_rt_apply.sh
-│       ├── systemd/franka-dma-latency.service   # holds /dev/cpu_dma_latency at 0us
-│       ├── systemd/franka-realtime-setup.service  # optional sysctl tunings
-│       └── sudoers.d/franka_rt           # passwordless franka_pin_helper
+│   ├── check_environment.sh                  preflight dependency check
+│   ├── install_nuc.sh                        (NUC) deploy install/nuc/* into /usr/local/sbin
+│   ├── install_pro4000.sh                    (pro4000) base install (conda env + repo)
+│   ├── install_pro4000_rt.sh                 (pro4000) RT-tune (rtprio, NIC IRQ, governor)
+│   ├── latency_calibration.json              live JSON consumed by env/policy classes
+│   ├── nuc/                                  raw RT scripts + systemd units shipped to NUC
+│   └── pro4000/                              pro4000 RT scripts + systemd unit
 ├── bin/
-│   ├── start_teleop.sh                   ← demo_franka_vive wrapper (ART+ZED defaults)
-│   ├── start_eval.sh                     ← eval_franka_policy wrapper
-│   ├── start_vive_stack.sh               ← vrserver --keepalive + vive_input bring-up
-│   ├── start_unified_bridge_on_nuc.sh    ← optional ZeroRPC bridge launcher (UMI/DROID compat)
-│   ├── run_test_session.sh               ← setsid'd long-running session launcher
-│   └── cv2_viewer.py                     ← cv2.imshow subprocess (signal relay to demo)
-├── polymetis_franka_teleop/              ← Python package (pip install -e .)
-│   ├── shared_memory/                    ← lock-free SHM primitives (UMI vendored)
-│   ├── common/                           ← pose math, precise_sleep, latency, accumulators
+│   ├── preflight_full.sh                     auto-fix preflight (stale-proc / ART / ZED / Vive / NUC)
+│   ├── start_teleop.sh                       data collection wrapper (DP/UMI defaults: 10 Hz)
+│   ├── start_teleop_groot_droid_ft.sh        data collection wrapper (GR00T defaults: 15 Hz)
+│   ├── run_test_session.sh                   setsid'd one-shot wrapper (DP/UMI)
+│   ├── run_test_session_groot_ft.sh          setsid'd one-shot wrapper (GR00T)
+│   ├── start_eval.sh                         policy-eval wrapper
+│   ├── start_vive_stack.sh                   vrserver --keepalive + vive_input
+│   ├── monitor_session.sh                    live 5-s dashboard (overruns, recoveries, fps)
+│   └── cv2_viewer.py                         cv2.imshow subprocess (signal relay to demo)
+├── polymetis_franka_teleop/                  Python package (pip install -e .)
+│   ├── shared_memory/                        lock-free SHM primitives (UMI vendored)
+│   ├── common/
+│   │   ├── pose_*.py / interpolation_util.py / rotation_transformer.py / cv2_util.py
+│   │   ├── precise_sleep.py
+│   │   ├── timestamp_accumulator.py
+│   │   ├── realtime_util.py                  apply_realtime() — affinity + SCHED_RR pinning
+│   │   └── latency_config.py                 backend-aware latency lookup
 │   └── real_world/
-│       ├── franka_interpolation_controller.py   200 Hz polymetis arm controller (mode={direct,zerorpc})
-│       ├── franka_gripper_controller.py         Franka Hand 30 Hz (ZeroRPC)
-│       ├── art_gripper_controller.py     ★KIST  ART gripper 30 Hz (TCP daemon)
-│       ├── single_zed.py / multi_zed.py  ★KIST  ZED camera workers
-│       ├── single_realsense.py / multi_realsense.py  legacy UMI camera workers
+│       ├── franka_interpolation_controller.py    100 Hz polymetis arm controller (direct gRPC)
+│       ├── art_gripper_controller.py             ART gripper 60 Hz (TCP daemon)
+│       ├── franka_gripper_controller.py          Franka Hand 60 Hz (zerorpc :4242)
+│       ├── single_zed.py / multi_zed.py          ZED camera workers
+│       ├── single_realsense.py / multi_realsense.py   RealSense camera workers
 │       ├── vive_shared_memory.py / vive_teleop_process.py
 │       ├── video_recorder.py / image_transform.py / keystroke_counter.py
 │       ├── multi_camera_visualizer.py
-│       ├── franka_vive_env.py            data-collection env (backend-selectable)
-│       ├── franka_policy_env.py          policy-eval env (backend-selectable)
-│       └── real_inference_util.py        obs/action transforms shared with training
-├── scripts_real/                         ← user-facing entry points
-│   ├── demo_franka_vive.py               data collection
-│   ├── eval_franka_policy.py             policy eval
-│   ├── preflight_check.py                interactive preflight
-│   ├── launch_franka_unified_server.py   NUC ZeroRPC bridge (deployed by bin/start_unified_bridge_on_nuc.sh)
-│   ├── calibrate_*.py                    latency calibration
-│   ├── convert_franka_vive_to_umi_format.py  → UMI / Diffusion Policy dataset
-│   └── convert_to_gr00t_lerobot.py       ★KIST → GR00T DROID embodiment dataset
-└── examples/
-    ├── run_live_test.py                  headless 3-min teleop + auto convert
-    └── check_recording.py                Zarr + video integrity + GR00T metadata check
+│       ├── franka_vive_env.py                data-collection env (backend-selectable)
+│       ├── franka_policy_env.py              policy-eval env (backend-selectable)
+│       └── real_inference_util.py            obs/action transforms shared with training
+└── scripts_real/
+    ├── demo_franka_vive.py                   data collection
+    ├── eval_franka_policy.py                 policy eval (DP / HF-LeRobot)
+    ├── preflight_check.py                    Python preflight (called by demo)
+    ├── calibrate_franka_arm_direct.py        arm latency via direct :50051
+    ├── calibrate_art_gripper_latency.py      ART gripper latency via :50053
+    ├── calibrate_zed_latency.py              ZED HW timestamp latency
+    ├── calibrate_realsense_latency.py        RealSense HW timestamp latency
+    ├── convert_to_gr00t_lerobot.py           → GR00T DROID embodiment dataset
+    ├── convert_to_lerobot.py                 → generic LeRobot v2 (ACT / HF-LeRobot)
+    └── convert_franka_vive_to_umi_format.py  → UMI / Diffusion-Policy zarr.zip
 ```
 
 ## Sister repositories
 
-This workspace depends on (and stays consistent with) two adjacent KIST repos — both are clone-and-go, no source modifications required here:
-
 | Repo | What it provides | How we use it |
 |---|---|---|
 | [`Hyundai_motors_Gripper`](https://github.com/Seung-Sub/Hyundai_motors_Gripper) | ART gripper EtherCAT daemon + Python client | `art_gripper_client` library import, daemon runs as systemd on pro4000 |
-| `Isaac-GR00T` (your fork) | GR00T model + DROID inference + Vive_input source | NUC RT setup is shared (see `docs/install_from_scratch.md` §1), Vive_input C++ binary reused from `~/Isaac-GR00T/vive_input/build/` |
+| [`Isaac-GR00T`](https://github.com/NVIDIA/Isaac-GR00T) (or your fork) | GR00T model + DROID inference + `vive_input` C++ source | NUC RT setup is shared (see `docs/install_from_scratch.md` §1); `vive_input` binary reused from `~/Isaac-GR00T/vive_input/build/` |

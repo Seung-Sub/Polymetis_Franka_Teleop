@@ -92,8 +92,7 @@ Ports the stack listens on:
 | Service | Where | Port | Notes |
 |---|---|---|---|
 | Polymetis arm gRPC | NUC | 50051 | `start_franka_arm.sh` |
-| Polymetis franka_hand gRPC | NUC | 50052 | `start_franka_gripper.sh` (skip for ART) |
-| ZeroRPC unified bridge (optional) | NUC | 4242 | `bin/start_unified_bridge_on_nuc.sh` |
+| Polymetis Franka Hand (zerorpc) | NUC | 4242 | `start_franka_gripper.sh` (skip for ART) |
 | ART gripper daemon | pro4000 | 50053 | systemd, auto-start |
 | `vive_input` | pro4000 | 12345 (TCP) / 12346 (UDP) | from `vive_ws` |
 
@@ -174,7 +173,7 @@ make -j && sudo make install
 
 ### B-4. SSH key from pro4000 to NUC
 
-The pro4000 helper scripts (`bin/start_unified_bridge_on_nuc.sh`,
+The pro4000 helper scripts (`bin/preflight_full.sh` and friends, plus
 `scripts/kist/cleanup_all.sh` in Isaac-GR00T) ssh into the NUC. Set up
 key-based auth once:
 
