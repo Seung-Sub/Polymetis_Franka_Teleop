@@ -71,8 +71,15 @@ def measure_one(serial: int, frames: int, fps: int, resolution: str) -> dict:
     init.camera_resolution = res_map[resolution]
     init.camera_fps = fps
     cam = sl.Camera()
-    if cam.open(init) != sl.ERROR_CODE.SUCCESS:
-        raise SystemExit(f'  [ERROR] could not open ZED with serial {serial}')
+    err = cam.open(init)
+    if err != sl.ERROR_CODE.SUCCESS:
+        # Mirror single_zed.py: POTENTIAL_CALIBRATION_ISSUE is a non-fatal
+        # warning. Other errors are fatal.
+        if str(err).strip().upper() == 'POTENTIAL CALIBRATION ISSUE':
+            print(f'  [WARN] ZED {serial} reported POTENTIAL CALIBRATION ISSUE -- '
+                  f'continuing (LEFT eye only, no depth used).')
+        else:
+            raise SystemExit(f'  [ERROR] could not open ZED with serial {serial}: {err}')
 
     rt = sl.RuntimeParameters()
     mat = sl.Mat()

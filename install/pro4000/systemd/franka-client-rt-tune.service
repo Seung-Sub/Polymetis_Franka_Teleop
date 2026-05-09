@@ -1,0 +1,12 @@
+[Unit]
+Description=Franka client-side RT tuning on pro4000 (NIC IRQ pin, governor, irqbalance off)
+After=network-online.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/franka_client_rt_apply.sh
+
+[Install]
+WantedBy=multi-user.target

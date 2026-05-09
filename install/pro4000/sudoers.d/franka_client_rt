@@ -1,0 +1,7 @@
+# /etc/sudoers.d/franka_client_rt -- let regular user grant CAP_SYS_NICE so
+# Python apply_realtime() can use SCHED_RR without sudo. Without this drop-in,
+# apply_realtime() falls back to nice -10 (still effective via /etc/security/
+# limits.d/franka.conf if installed) or to CPU affinity only.
+#
+# Replace 'kist' with your actual user if different.
+kist ALL=(ALL) NOPASSWD: /bin/setcap *=eip *
