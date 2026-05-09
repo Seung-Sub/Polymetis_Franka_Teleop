@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Calibrate Franka arm latency on the **direct polymetis** gRPC path.
+"""Calibrate Franka arm latency on the polymetis gRPC path.
 
-Production setup at KIST runs ``FrankaInterpolationController`` in
-``polymetis_mode='direct'``: pro4000 → NUC :50051 (raw gRPC), no
-ZeroRPC bridge. The legacy ``calibrate_franka_robot_latency.py`` measures
-the bridge path (:4242) and does NOT reflect what the env actually
-experiences.
+KIST production setup runs ``FrankaInterpolationController`` against
+``polymetis launch_robot.py`` directly: pro4000 → NUC :50051 (raw gRPC).
 
 This script measures the production path:
 

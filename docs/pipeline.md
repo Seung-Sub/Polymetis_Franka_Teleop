@@ -79,10 +79,12 @@ SharedMemoryManager (프로세스 간 공유 메모리 통합 관리자)
 ### Polymetis 서버 (NUC)
 
 ```
-NUC (192.168.1.10, Port 4242)
-└── polymetis / ZeroRPC 서버
-     ├── update_desired_ee_pose()  ← FrankaInterpolationController에서 호출
-     └── franka_gripper.goto() / grasp() ← FrankaGripperController에서 호출
+NUC (192.168.1.12)
+├── polymetis arm 서버 :50051 (gRPC)
+│    └── update_desired_ee_pose() / update_desired_joint_positions()
+│        ← FrankaInterpolationController (direct gRPC client)에서 호출
+└── polymetis Franka Hand 서버 :4242 (zerorpc — --gripper_backend franka 인 경우에만 띄움)
+     └── gripper.goto() / grasp() ← FrankaGripperController에서 호출
 ```
 
 ---
@@ -247,9 +249,9 @@ validate_position_change(delta_pos, threshold=0.05m):
 
 ---
 
-## 6. FrankaInterpolationController — 200Hz 로봇 팔 제어 (`umi/real_world/franka_interpolation_controller.py`)
+## 6. FrankaInterpolationController — 100Hz 로봇 팔 제어 (`polymetis_franka_teleop/real_world/franka_interpolation_controller.py`)
 
-별도 프로세스로 실행. ZeroRPC를 통해 NUC의 polymetis 서버에 연결.
+별도 프로세스로 실행. polymetis Python 클라이언트(`RobotInterface`)를 통해 NUC `:50051` gRPC 서버에 직접 연결 (UMI/DROID 시절의 ZeroRPC bridge 거치지 않음).
 
 ### 6.1 Cartesian Impedance Control 파라미터
 
@@ -314,10 +316,11 @@ STOP                              # 제어 루프 중단
 ```
 libfranka 예외 (충돌 감지 등) 발생 시:
   1. 컨트롤러 중단 감지
-  2. ZeroRPC 재연결 시도
-  3. Impedance 컨트롤러 재시작
-  4. HOME 포지션으로 복귀
-  5. Teleop 모드: Clutch 재결합 대기
+  2. polymetis automaticErrorRecovery 호출
+  3. Impedance 컨트롤러 재시작 + wait_until_controller_ready
+  4. reset_ik_state (catalog #26) — IK seed 재초기화
+  5. HOME 포지션으로 복귀 (auto-HOME 에스컬레이션, catalog #27)
+  6. Teleop 모드: Clutch 재결합 대기
 ```
 
 ### 6.7 상태 출력 (RingBuffer 스키마)
@@ -524,8 +527,9 @@ get_latency(
 | 카메라 관측 | **15ms** | HW 타임스탬프 기반 V3 측정 |
 | 로봇 관측 | **1ms** | 왕복 시간의 절반 |
 | 그리퍼 관측 | **1ms** | 왕복 시간의 절반 |
-| 로봇 액션 실행 | **55ms ± 3.3ms** | schedule_waypoint → 실제 도달 측정 |
-| 그리퍼 액션 실행 | **85ms (63~100ms)** | ZeroRPC 직접 명령 기준 측정 |
+| 로봇 액션 실행 | **55ms ± 3.3ms** | schedule_waypoint → 실제 도달 측정 (calibrate_franka_arm_direct.py) |
+| 그리퍼 액션 실행 (ART) | 측정값 | floor-offset 측정 (calibrate_art_gripper_latency.py) |
+| 그리퍼 액션 실행 (Franka Hand) | 측정값 | 직접 명령 측정 — 기존 V3 fallback 85ms (63–100ms range) |
 
 ### 보정 적용 위치 (`exec_actions()` 내)
 
@@ -1061,4 +1065,4 @@ pose_repr:
 | **steps_per_inference=6** | 추론이 늦으면 일부 스텝 건너뜀 (시간 초과 시 마지막 액션 1개만 실행) |
 | **gripper_close_width=0.005m** | 0.0m 사용 시 libfranka 예외 — 5mm 여유 필요 |
 | **포즈 표현 설정 의존성** | 학습 시 `obs_pose_repr`/`action_pose_repr`와 실행 시 설정이 반드시 일치해야 함 |
-| **ROS2 비의존** | 신버전은 RealSense SDK + ZeroRPC 직접 통신 — ROS2 RealSense 노드와 충돌 주의 |
+| **ROS2 비의존** | RealSense SDK / ZED SDK 직접 임포트, polymetis는 :50051 gRPC 직접 — ROS2 노드와 충돌 주의 |

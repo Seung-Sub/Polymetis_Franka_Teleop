@@ -17,9 +17,8 @@
               │             │                  │
         ZED 2i + Mini    Hyundai gripper      NUC ─── Franka FCI
         (33538770,        (NETX 90-RE/ECS)   192.168.1.12
-         11667817)         enxb0386cf13036    polymetis :50051
-                                              franka_hand :50052
-                                              unified ZeroRPC :4242
+         11667817)         enxb0386cf13036    polymetis arm :50051 (gRPC)
+                                              Franka Hand :4242 (zerorpc, opt-in)
 ```
 
 ## Networking
@@ -31,8 +30,7 @@
 | pro4000 Hyundai EtherCAT | enxb0386cf13036 | private | 161.122.115.1 |
 | NUC | (Franka box) | kist-NUC13ANHi7 | 192.168.1.12 |
 | Polymetis arm gRPC | NUC | franka_panda_client | :50051 |
-| Polymetis franka_hand gRPC | NUC | franka_hand_client | :50052 |
-| ZeroRPC unified | NUC | franka_unified | :4242 |
+| Polymetis Franka Hand (zerorpc, opt-in) | NUC | franka_hand_client | :4242 |
 | ART daemon | pro4000 | art_gripper_daemon | :50053 |
 | Vive input | pro4000 | vive_input (vive_ws) | :12345 (TCP) / :12346 (UDP haptic) |
 

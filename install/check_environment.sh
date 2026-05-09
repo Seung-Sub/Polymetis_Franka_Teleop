@@ -75,8 +75,8 @@ ping -c 1 -W 1 192.168.1.12 >/dev/null 2>&1 && ok "NUC 192.168.1.12 reachable" \
 # 10. NUC services
 nc -z -w 2 192.168.1.12 50051 2>/dev/null && ok "NUC polymetis arm :50051 reachable" \
     || warn "NUC polymetis arm :50051 not reachable — sudo bash /usr/local/sbin/start_franka_arm.sh on NUC"
-nc -z -w 2 192.168.1.12 4242 2>/dev/null && ok "NUC ZeroRPC bridge :4242 reachable" \
-    || warn "NUC ZeroRPC bridge :4242 not reachable — bash bin/start_unified_bridge_on_nuc.sh"
+nc -z -w 2 192.168.1.12 4242 2>/dev/null && ok "NUC Franka Hand polymetis service :4242 reachable" \
+    || warn "NUC Franka Hand :4242 not reachable — only required for --gripper_backend franka (sudo bash /usr/local/sbin/start_franka_gripper.sh on NUC)"
 
 echo
 echo "Done. Resolve any [FAIL] lines before running demo_franka_vive.py."

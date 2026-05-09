@@ -69,9 +69,9 @@ class FrankaPolicyEnv:
 
     Args:
         output_dir: Directory for saving episode recordings
-        robot_ip: IP address of NUC running Franka interface server
-        robot_port: ZeroRPC port for robot control (default: 4242)
-        gripper_port: ZeroRPC port for gripper control (default: 4242)
+        robot_ip: IP address of NUC running polymetis (and optionally Franka Hand)
+        robot_port: polymetis arm gRPC port (default: 50051)
+        gripper_port: Franka Hand polymetis service port (zerorpc :4242). Ignored for ART backend.
         frequency: Main loop frequency in Hz (default: 10)
         camera_serial_numbers: List of RealSense serial numbers
         camera_resolution: Camera capture resolution (W, H)

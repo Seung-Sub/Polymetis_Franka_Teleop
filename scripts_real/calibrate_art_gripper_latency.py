@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Calibrate ART gripper observation + action latency (direct TCP path).
 
-The ART gripper does NOT go through Polymetis / ZeroRPC like the Franka
-Hand. It speaks raw TCP to a daemon on :50053 (see
-Hyundai_motors_Gripper/src/server.cpp). The existing
-``calibrate_franka_gripper_latency.py`` measures the ZeroRPC path and
-its numbers are NOT representative of the ART path.
+The ART gripper does NOT go through Polymetis like the Franka Hand. It
+speaks raw TCP to a daemon on :50053 (see
+Hyundai_motors_Gripper/src/server.cpp). For Franka Hand latency
+measurement, copy this file as a template and substitute the polymetis
+Franka Hand zerorpc protocol (``gripper.goto`` / ``gripper.get_state``
+on :4242).
 
 This script:
 
