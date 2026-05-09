@@ -310,34 +310,14 @@ class FrankaInterface:
                 self.robot.update_desired_joint_positions(self._last_good_joint_target)
             return
         self._ik_fail_streak = 0
-        # Joint-velocity clamp BEFORE sending to polymetis (catalog #35).
-        # libfranka's safety_controller fires "joint_velocity_violation" when
-        # |delta_q / dt| exceeds Franka's per-joint velocity limit. The pre-
-        # vious code path sent IK output unchanged, so a fast Vive motion ->
-        # large delta_q -> reflex. Pre-clamping the commanded delta-q to
-        # 2.0 rad/s causes the robot to lag slightly under fast Vive moves
-        # (smooth tracking) instead of triggering a reflex. The dt assumed
-        # is 10 ms (100 Hz teleop) which is what FrankaInterpolationController
-        # actually runs at; using a slightly conservative 8 ms = 0.016 rad/cmd
-        # gives more headroom against per-iter jitter.
-        try:
-            import torch as _torch
-            q_now = self._cached_q if self._cached_q is not None \
-                else self.robot.get_joint_positions()
-            dq = (joint_target - q_now).numpy() if hasattr(joint_target, 'numpy') \
-                else np.asarray(joint_target) - np.asarray(q_now)
-            max_dq = 0.016   # 2.0 rad/s * 8 ms
-            mx = float(np.max(np.abs(dq)))
-            if mx > max_dq:
-                scale = max_dq / mx
-                dq_clamped = dq * scale
-                joint_target = (
-                    _torch.as_tensor(np.asarray(q_now) + dq_clamped, dtype=_torch.float32)
-                )
-        except Exception:
-            # If anything goes wrong (shape/dtype), fall back to unclamped.
-            # No-op exception path keeps the original behaviour as a safety net.
-            pass
+        # NOTE: catalog #35's joint-velocity pre-clamp was REVERTED on
+        # 2026-05-09. The 2.0 rad/s clamp was too close to Franka's per-joint
+        # velocity limits (j0-j3 = 2.175 rad/s, j4-j6 = 2.61 rad/s) and made
+        # ALL teleop noticeably slow, not just the bursts that would have
+        # tripped libfranka's safety_controller. A future re-introduction
+        # should either (a) use per-joint thresholds at ~90% of each Franka
+        # limit, (b) only kick in when the IK delta is well above ordinary
+        # teleop, or (c) be opt-in via a CLI flag for high-precision tasks.
         self._last_good_joint_target = joint_target
         self.robot.update_desired_joint_positions(joint_target)
 
