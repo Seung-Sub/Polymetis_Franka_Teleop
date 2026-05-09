@@ -260,7 +260,22 @@ class SingleZed(mp.Process):
             init.depth_mode = sl.DEPTH_MODE.NONE
             init.coordinate_units = sl.UNIT.METER
             err = cam.open(init)
-            if err != sl.ERROR_CODE.SUCCESS:
+            # POTENTIAL_CALIBRATION_ISSUE is a *warning*, not an error in the
+            # ZED SDK: the camera opens and streams just fine, the SDK is only
+            # cautioning that stereo depth precision may be off (calibration
+            # drift, temperature, or a different sensor batch than the cal
+            # file expected). We use LEFT eye only and never compute depth,
+            # so this warning is safe to ignore. Treating it as fatal causes
+            # MultiZed (concurrent open of two cameras) to crash one of them
+            # -- observed on KIST ZED 2i (sn 33538770) on 2026-05-09.
+            if err == sl.ERROR_CODE.SUCCESS:
+                pass
+            elif str(err).strip().upper() == 'POTENTIAL CALIBRATION ISSUE':
+                print(f'[SingleZed {self.serial_number}] WARN: POTENTIAL CALIBRATION '
+                      f'ISSUE -- continuing (LEFT eye only, no depth needed). '
+                      f'If you need depth, refresh /usr/local/zed/settings/SN*.conf '
+                      f'(install_from_scratch.md Phase F-2).')
+            else:
                 raise RuntimeError(f'ZED open failed sn={self.serial_number}: {err}')
 
             ci = cam.get_camera_information()

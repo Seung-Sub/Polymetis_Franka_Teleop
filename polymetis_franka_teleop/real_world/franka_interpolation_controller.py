@@ -138,6 +138,10 @@ class FrankaInterface:
         # for >1 s would cascade-kill the controller.
         self._last_good_joint_target = None
         self._ik_fail_streak = 0
+        # Wallclock when the last visible "IK STUCK" warning was printed,
+        # so we throttle the warning rate without throttling the recovery.
+        self._last_ik_stuck_warn_t = 0.0
+
         if mode == 'zerorpc':
             import zerorpc
             self._rpc = zerorpc.Client(heartbeat=20)
@@ -156,6 +160,59 @@ class FrankaInterface:
         else:
             self.tx_flange_tip = tx_flange_tip
             self.tx_tip_flange = tx_tip_flange
+
+    def wait_until_controller_ready(self, max_wait_s: float = 1.5,
+                                    poll_period_s: float = 0.01) -> bool:
+        """Poll until the active polymetis controller actually accepts joint
+        updates, instead of using a blind ``time.sleep(1.5)``.
+
+        Why: ``start_cartesian_impedance`` returns success as soon as polymetis
+        QUEUES the new policy load, but the controller takes 50-400 ms more
+        to be ready. During that window any ``update_desired_joint_positions``
+        call returns "Use 'start_joint_impedance' to start a joint impedance
+        controller" / "Tried to perform a controller update with no controller
+        running" -- which our exception handler treats as a recovery and
+        triggers another start_cartesian_impedance, perpetuating the race.
+
+        This poll calls ``update_desired_joint_positions(current_q)`` (a
+        no-op feed since target == current) repeatedly until it stops
+        raising. The first successful call confirms the controller has
+        finished loading. Returns True on success, False on timeout.
+
+        Catalog #29.
+        """
+        if self.mode == 'zerorpc':
+            # Nothing to poll — bridge handles its own state
+            time.sleep(0.3)
+            return True
+        deadline = time.monotonic() + max_wait_s
+        while time.monotonic() < deadline:
+            try:
+                q_now = self.robot.get_joint_positions()
+                self.robot.update_desired_joint_positions(q_now)
+                return True
+            except Exception:
+                time.sleep(poll_period_s)
+        return False
+
+    def reset_ik_state(self):
+        """Reset the IK seed + last-good-joint-target after a controller restart.
+
+        After a libfranka reflex + automaticErrorRecovery + start_cartesian_
+        impedance cycle, the robot is at a fresh pose but our cached IK seed
+        (``_cached_q``) and silent-failure fallback (``_last_good_joint_
+        target``) still hold the values from BEFORE the reflex. If the user
+        commands a target near the previous reflex configuration, IK will
+        seed from that bad pose and fail; the silent fallback then replays
+        the same bad joint target every tick, leaving the robot frozen and
+        the user unable to move with Grip (only trackpad-HOME, which uses
+        a different code path, escapes). Calling this method on every
+        successful recovery forces the next IK call to fetch fresh joints
+        and breaks that lock.
+        """
+        self._cached_q = None
+        self._last_good_joint_target = None
+        self._ik_fail_streak = 0
 
     # ----- low-level state -----
     def _flange_pose_6d(self):
@@ -236,6 +293,19 @@ class FrankaInterface:
                 print(f"[FrankaInterface] IK failed {self._ik_fail_streak}x "
                       f"in a row — sending last good joint target to keep "
                       f"polymetis watchdog alive.", flush=True)
+            # Visible warning when IK is stuck for >2 seconds (200 ticks at
+            # 100 Hz) — tells the user to press trackpad HOME instead of
+            # waiting in vain. Throttled to once per 2 s so the log isn't
+            # spammed if the streak persists for minutes.
+            now_t = time.monotonic()
+            if (self._ik_fail_streak >= 200
+                    and (now_t - self._last_ik_stuck_warn_t) > 2.0):
+                print("[FrankaInterface] IK STUCK -- robot has not moved for "
+                      ">2 s due to repeated IK failures. The cached IK seed "
+                      "is likely from a near-singular configuration. **Press "
+                      "trackpad HOME** (or press 'h') to recover.",
+                      flush=True)
+                self._last_ik_stuck_warn_t = now_t
             if self._last_good_joint_target is not None:
                 self.robot.update_desired_joint_positions(self._last_good_joint_target)
             return
@@ -494,10 +564,26 @@ class FrankaInterpolationController(mp.Process):
 
     # ========= main loop in process ============
     def run(self):
-        # enable soft real-time
-        if self.soft_real_time:
-            os.sched_setscheduler(
-                0, os.SCHED_RR, os.sched_param(20))
+        # Always pin to dedicated cores away from NIC IRQ (cores 6,7 by default
+        # on pro4000's 14-core CPU). This is the single most effective fix for
+        # `communication_constraints_violation` reflex storms — see
+        # docs/troubleshooting.md catalog #25.
+        try:
+            from polymetis_franka_teleop.common.realtime_util import apply_realtime, PRO4000_CORE_MAP
+            apply_realtime(
+                cores=PRO4000_CORE_MAP.get('franka_interp'),
+                sched_priority=20,  # SCHED_RR/20 -- preempts SCHED_OTHER, well below NUC's RTPRIO 80
+                name='FrankaInterp',
+            )
+        except Exception as e:
+            print(f"[FrankaPositionalController] WARN: realtime tuning skipped: {e}")
+        # Legacy SCHED_RR-only path (still honored if user passes soft_real_time=True
+        # but the realtime_util import failed — kept for backwards compatibility)
+        if self.soft_real_time and 'apply_realtime' not in dir():
+            try:
+                os.sched_setscheduler(0, os.SCHED_RR, os.sched_param(20))
+            except Exception:
+                pass
 
         # Compute TCP transformation
         tx_flange_tip_local = compute_tcp_transform(
@@ -582,10 +668,14 @@ class FrankaInterpolationController(mp.Process):
                 Kx=self.Kx,
                 Kxd=self.Kxd
             )
-            # Stabilization wait — polymetis takes 200-400 ms typical to
-            # bring the new impedance policy fully online on the NUC RT
-            # thread. 1.0 s is conservative and matches the recovery path.
-            time.sleep(1.0)
+            # Wait until polymetis controller actually accepts updates
+            # (poll-until-ready, see catalog #29). Replaces blind sleep(1.5).
+            # Returns True when controller is taking joint updates -- usually
+            # 100-300 ms. Times out at 1.5 s with False if polymetis is stuck.
+            if not robot.wait_until_controller_ready(max_wait_s=1.5):
+                print("[FrankaPositionalController] WARN: controller still not "
+                      "ready after 1.5 s -- next iteration may re-trigger "
+                      "recovery", flush=True)
 
             t_start = time.monotonic()
             iter_idx = 0
@@ -598,6 +688,15 @@ class FrankaInterpolationController(mp.Process):
             recovery_count = 0
             recovery_last_summary_t = time.monotonic()
             recovery_just_fired = False  # set True on the iter that recovers
+            # Auto-HOME escalation: when start_cartesian_impedance silently
+            # fails (polymetis returns "Use start_joint_impedance" because
+            # the controller didn't actually take), simple recoveries cascade
+            # forever. Track consecutive recoveries within a 10 s window and
+            # auto-trigger a HOME (which forces a full polymetis state reset
+            # via move_to_joint_positions) after 2 in a row.
+            consecutive_recovery_count = 0
+            last_clean_iter_t = time.monotonic()
+            auto_home_pending = False
 
             # Teleop mode state
             teleop_target_pose = curr_pose.copy()
@@ -718,6 +817,23 @@ class FrankaInterpolationController(mp.Process):
                         'torque_discontinuity'
                     ]):
                         recovery_count += 1
+                        # Track recoveries within a 10 s window. If two fire
+                        # back-to-back without any clean run in between,
+                        # start_cartesian_impedance is silently failing and
+                        # we escalate to a full HOME (catalog #27).
+                        now_rec_t = time.monotonic()
+                        if (now_rec_t - last_clean_iter_t) < 10.0:
+                            consecutive_recovery_count += 1
+                        else:
+                            consecutive_recovery_count = 1
+                        last_clean_iter_t = now_rec_t
+                        if consecutive_recovery_count >= 2 and self.teleop_mode:
+                            print(f"[FrankaPositionalController] !! "
+                                  f"{consecutive_recovery_count} recoveries in <10 s -- "
+                                  f"start_cartesian_impedance not taking. "
+                                  f"Auto-HOME to force polymetis state reset.",
+                                  flush=True)
+                            auto_home_pending = True
                         # Print full detail on first error so we can identify
                         # the trigger; subsequent ones print a one-liner so
                         # the user can see them happening (was previously
@@ -745,16 +861,48 @@ class FrankaInterpolationController(mp.Process):
                             # the loop's next update_desired_ee_pose call —
                             # polymetis takes 200-400 ms typical but can be
                             # 800+ ms under load; 0.5 s used to cascade into
-                            # repeat recoveries. 1.0 s is conservative.
+                            # repeat recoveries. 1.5 s breaks the cascade
+                            # observed at KIST 2026-05-09 (8 reflex trips
+                            # in 1.5 min window with 1.0 s settle).
                             robot.start_cartesian_impedance(
                                 Kx=self.Kx,
                                 Kxd=self.Kxd
                             )
-                            time.sleep(1.0)
+                            # Poll-until-ready instead of blind sleep (catalog #29).
+                            if not robot.wait_until_controller_ready(max_wait_s=1.5):
+                                print("[FrankaPositionalController] WARN: controller "
+                                      "still not ready 1.5 s after recovery -- "
+                                      "auto-HOME will fire next iter", flush=True)
+
+                            # CRITICAL: reset the IK seed + last-good-joint-
+                            # target. The previous values were captured BEFORE
+                            # the reflex and may correspond to a near-singular
+                            # configuration; without resetting, the next IK
+                            # call seeds from the bad pose, fails, the silent-
+                            # failure path replays the same bad joint target
+                            # every tick, and the user sees Grip not respond
+                            # while only HOME (which uses a different code
+                            # path) escapes. Reset here forces the next IK
+                            # call to fetch fresh joints. Catalog #26.
+                            robot.reset_ik_state()
+
+                            # CRITICAL: reset the loop timer so we do NOT
+                            # "catch up" the 1.5 s sleep with a burst of
+                            # 250+ Hz update_desired_joint_positions calls
+                            # — that burst overwhelmed polymetis's
+                            # HybridJointImpedanceController state machine
+                            # and immediately re-tripped reflex (catalog #27,
+                            # observed at KIST 2026-05-09: cumulative 6
+                            # recoveries every 3.7 s in a 22 s window).
+                            # HOME's code path already does this (line 1011);
+                            # missing it here was the cascade root cause.
+                            t_start = time.monotonic()
+                            iter_idx = 0
+                            last_waypoint_time = t_start
 
                             # Update interpolator with fresh pose
                             pose_interp = PoseTrajectoryInterpolator(
-                                times=[time.monotonic()],
+                                times=[t_start],
                                 poses=[curr_pose]
                             )
 
@@ -848,6 +996,34 @@ class FrankaInterpolationController(mp.Process):
                 except Exception:
                     pass
 
+                # Joint-limit early-warning. Franka hard limits per joint:
+                # j3 (elbow)  -> 2.97 rad   (warn at 2.5)
+                # j5 (wrist2) -> 2.97 rad   (warn at 2.5)
+                # j6 (wrist3) -> 2.89 rad   (warn at 2.5)
+                # When teleop pushes past warning level the cartesian
+                # impedance starts requiring high torque, and small extra
+                # motion trips libfranka's safety_controller (Joint velocity
+                # violation -> reflex). Warn (10 s throttled) so user can
+                # back off before reflex fires. Catalog #28.
+                if not hasattr(self, '_last_joint_warn_t'):
+                    self._last_joint_warn_t = {3: 0.0, 5: 0.0, 6: 0.0}
+                try:
+                    qabs = [abs(float(state['ActualQ'][j])) for j in range(7)]
+                except Exception:
+                    qabs = [0.0] * 7
+                now_warn_t = time.monotonic()
+                _jlim = {3: 2.97, 5: 2.97, 6: 2.89}
+                _jname = {3: 'j3 (elbow)', 5: 'j5 (wrist-flex)', 6: 'j6 (wrist-roll)'}
+                for j in (3, 5, 6):
+                    if (qabs[j] > 2.5
+                            and (now_warn_t - self._last_joint_warn_t[j]) > 10.0):
+                        margin = _jlim[j] - qabs[j]
+                        print(f"[FrankaPositionalController] !! "
+                              f"{_jname[j]}={qabs[j]:.3f} rad "
+                              f"(limit {_jlim[j]}, margin {margin:.3f}) -- "
+                              f"back off before reflex fires", flush=True)
+                        self._last_joint_warn_t[j] = now_warn_t
+
                 # fetch command from queue (works in both modes)
                 try:
                     # process at most 1 command per cycle to maintain frequency
@@ -855,6 +1031,24 @@ class FrankaInterpolationController(mp.Process):
                     n_cmd = len(commands['cmd'])
                 except Empty:
                     n_cmd = 0
+
+                # Auto-HOME escalation: when start_cartesian_impedance silently
+                # failed and we hit 2+ recoveries within 10 s, inject a synthetic
+                # MOVE_HOME command. HOME does a
+                # move_to_joint_positions(home_joints) which forces polymetis
+                # to cycle through its trajectory tracking controller, which in
+                # turn forces a clean state transition that subsequent
+                # start_cartesian_impedance can actually take. Any user
+                # commands queued at the same instant are dropped; user can
+                # re-issue after HOME completes (~3 s). Catalog #27.
+                if auto_home_pending:
+                    auto_home_pending = False
+                    consecutive_recovery_count = 0
+                    commands = {'cmd': [Command.MOVE_HOME.value],
+                                'duration': [2.0]}
+                    n_cmd = 1
+                    print("[FrankaPositionalController] auto-HOME injected to "
+                          "force polymetis state reset (catalog #27)", flush=True)
 
                 # execute commands
                 for i in range(n_cmd):
@@ -928,11 +1122,18 @@ class FrankaInterpolationController(mp.Process):
                                 Kxd=self.Kxd
                             )
 
-                            # IMPORTANT: Wait for impedance controller to stabilize
-                            # The controller needs time to settle after restart.
-                            # Without this delay, immediate clutch engagement can cause jerk.
-                            STABILIZATION_DELAY = 0.5  # seconds
-                            time.sleep(STABILIZATION_DELAY)
+                            # Poll-until-ready instead of blind sleep (catalog #29).
+                            # 1.5 s timeout matches recovery path.
+                            if not robot.wait_until_controller_ready(max_wait_s=1.5):
+                                print("[FrankaPositionalController] WARN: post-HOME "
+                                      "controller did not come ready in 1.5 s",
+                                      flush=True)
+
+                            # Reset IK seed/last_good cache so the post-HOME
+                            # robot pose is the fresh seed for IK (catalog #26).
+                            # Even though HOME got us to ready_pose, the cache
+                            # may still hold stale values from before HOME.
+                            robot.reset_ik_state()
 
                             # 5. Update interpolator with fresh pose
                             pose_interp = PoseTrajectoryInterpolator(
@@ -959,6 +1160,7 @@ class FrankaInterpolationController(mp.Process):
                             # Try to restart impedance anyway
                             try:
                                 robot.start_cartesian_impedance(Kx=self.Kx, Kxd=self.Kxd)
+                                robot.reset_ik_state()  # see catalog #26
                             except:
                                 pass
                     else:
@@ -984,8 +1186,22 @@ class FrankaInterpolationController(mp.Process):
                           f"(watchdog limit 1000 ms)", flush=True)
                 recovery_just_fired = False
 
-                # regulate frequency
+                # Track clean iters for the auto-HOME escalation: any iter
+                # that reached this point without triggering recovery counts
+                # as "clean". The consecutive_recovery_count window resets
+                # itself naturally after 10 s of clean operation.
+                last_clean_iter_t = time.monotonic()
+
+                # regulate frequency + count overruns (iters where the
+                # precise_wait deadline was already past when we got there).
+                # High overrun rate = this loop is being scheduled-late by
+                # the kernel, which is the proximate cause of NUC's
+                # communication_constraints_violation reflex.
                 t_wait_util = t_start + (iter_idx + 1) * dt
+                if time.monotonic() > t_wait_util:
+                    if not hasattr(self, '_overrun_count'):
+                        self._overrun_count = 0
+                    self._overrun_count += 1
                 precise_wait(t_wait_util, time_func=time.monotonic)
 
                 # first loop successful, ready to receive command
@@ -996,7 +1212,10 @@ class FrankaInterpolationController(mp.Process):
                 if self.verbose and iter_idx % 100 == 0:
                     actual_freq = 1 / (time.monotonic() - t_now) if (time.monotonic() - t_now) > 0 else 0
                     mode_str = "TELEOP" if self.teleop_mode else "NORMAL"
-                    print(f"[FrankaPositionalController] [{mode_str}] Actual frequency: {actual_freq:.1f}Hz")
+                    overrun = getattr(self, '_overrun_count', 0)
+                    print(f"[FrankaPositionalController] [{mode_str}] Actual frequency: "
+                          f"{actual_freq:.1f}Hz  overruns={overrun}/100 (last 100 iters)")
+                    self._overrun_count = 0
 
         finally:
             # mandatory cleanup

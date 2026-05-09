@@ -73,6 +73,11 @@ def main():
     cv2.waitKey(1)
 
     poll_s = max(0.005, args.poll_ms / 1000.0)
+    # Double-press 'q' guard — accidental q presses (e.g. user typing in
+    # the wrong window, focus stolen by another app, fingertip slip while
+    # reaching for the controller) used to silently kill ongoing recording
+    # sessions. Now we require two q presses within 1.5 s.
+    last_q_t = 0.0
     while True:
         new_img, new_mtime = _read_jpeg_with_retry(args.path, last_mtime)
         if new_img is not None:
@@ -85,9 +90,16 @@ def main():
         if args.signal_pid > 0 and key != 0xFF:  # 0xFF (=255) means no key
             try:
                 if key == ord('q'):
-                    print('[cv2_viewer] q pressed -> SIGINT', flush=True)
-                    os.kill(args.signal_pid, signal.SIGINT)
-                    break
+                    now = time.monotonic()
+                    if now - last_q_t < 1.5:
+                        print('[cv2_viewer] q pressed twice -> SIGINT (clean shutdown)',
+                              flush=True)
+                        os.kill(args.signal_pid, signal.SIGINT)
+                        break
+                    else:
+                        print('[cv2_viewer] q pressed (1/2) -- press q again within '
+                              '1.5 s to confirm shutdown', flush=True)
+                        last_q_t = now
                 elif key == ord('c'):
                     print('[cv2_viewer] c pressed -> SIGUSR1 (record start)', flush=True)
                     os.kill(args.signal_pid, signal.SIGUSR1)

@@ -612,7 +612,36 @@ def main(output, robot_ip, robot_port, polymetis_mode, vive_host, vive_port,
                             (10, grid_h + 110),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, grip_color, 2)
 
-                # Fourth row: pending-drop confirmation if active
+                # Fourth row: joint-limit margins (j3/j5/j6 — the three joints
+                # that historically trigger libfranka safety_controller). Show
+                # in a single line, color-coded green if margin > 0.5 rad,
+                # amber if > 0.2, red if smaller. Catalog #28.
+                try:
+                    jp = obs.get('robot0_joint_pos', None)
+                    if jp is not None and len(jp.shape) >= 1:
+                        last_q = jp[-1] if jp.ndim == 2 else jp
+                        j3_a = abs(float(last_q[3]))
+                        j5_a = abs(float(last_q[5]))
+                        j6_a = abs(float(last_q[6]))
+                        # margins to soft limit (slightly conservative vs 2.97/2.97/2.89)
+                        m3 = 2.97 - j3_a
+                        m5 = 2.97 - j5_a
+                        m6 = 2.89 - j6_a
+                        def _jcolor(m):
+                            if m < 0.2: return (0, 0, 220)       # red
+                            if m < 0.5: return (0, 140, 220)     # amber
+                            return (60, 200, 60)                  # green
+                        cv2.putText(vis_img,
+                                    f'j3:{j3_a:.2f} ({m3:+.2f})  '
+                                    f'j5:{j5_a:.2f} ({m5:+.2f})  '
+                                    f'j6:{j6_a:.2f} ({m6:+.2f})',
+                                    (10, grid_h + 140),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                    _jcolor(min(m3, m5, m6)), 1)
+                except Exception:
+                    pass
+
+                # Fifth row: pending-drop confirmation if active
                 if pending_drop:
                     remaining = 5.0 - (time.monotonic() - pending_drop_time)
                     cv2.rectangle(vis_img, (0, grid_h + 140), (grid_w, grid_h + 178),

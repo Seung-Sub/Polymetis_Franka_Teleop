@@ -538,6 +538,21 @@ class FrankaViveEnv:
         """Start all processes."""
         import time
 
+        # Pin the main demo process AND any child that doesn't pin itself to
+        # the "general pool" cores 0-5, 10-13. Cores 6-9 are reserved for
+        # FrankaInterpolationController (6,7) and ArtGripperController (8,9).
+        # Without this, video recorder threads / multiprocessing helpers can
+        # land on cores 6-9 and steal cycles from the timing-critical loops,
+        # causing libfranka communication_constraints_violation reflex storms.
+        try:
+            import os
+            general_pool = {0, 1, 2, 3, 4, 5, 10, 11, 12, 13}
+            os.sched_setaffinity(0, general_pool)
+            print(f"[FrankaViveEnv] main + general children pinned to {sorted(general_pool)} "
+                  f"(cores 6-9 reserved for FrankaInterp/ArtGripper)")
+        except Exception as e:
+            print(f"[FrankaViveEnv] WARN: main affinity pin failed: {e}")
+
         # Start Vive first (others depend on it)
         self.vive.start(wait=True)
 

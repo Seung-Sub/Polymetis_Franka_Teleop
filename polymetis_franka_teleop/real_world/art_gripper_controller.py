@@ -195,6 +195,19 @@ class ArtGripperController(mp.Process):
 
     # ---------- subprocess loop ----------
     def run(self):
+        # Pin to dedicated cores away from NIC IRQ (cores 8,9 by default
+        # on pro4000) — prevents this 60 Hz TCP-polling loop from competing
+        # with the Polymetis client (cores 6,7) for CPU and avoids the
+        # GIL-pressure cascade that triggers libfranka reflex storms.
+        try:
+            from polymetis_franka_teleop.common.realtime_util import apply_realtime, PRO4000_CORE_MAP
+            apply_realtime(
+                cores=PRO4000_CORE_MAP.get('art_gripper'),
+                sched_priority=15,  # below FrankaInterp (20), still above default
+                name='ArtGripper',
+            )
+        except Exception as e:
+            print(f"[ArtGripperController] WARN: realtime tuning skipped: {e}")
         gripper = None
         try:
             # Lazy import + sys.path inject so the daemon repo can live anywhere.
@@ -311,18 +324,24 @@ class ArtGripperController(mp.Process):
                                     last_teleop_cmd = self.GRIPPER_CMD_NONE
                             elif cmd != last_teleop_cmd:
                                 try:
-                                    if cmd == self.GRIPPER_CMD_CLOSE:
-                                        gripper.grasp(width=target_w,
-                                                      speed=self.move_max_speed,
-                                                      force=self.default_force,
-                                                      timeout_s=2.0)
-                                        current_is_open = False
-                                    elif cmd == self.GRIPPER_CMD_OPEN:
-                                        gripper.goto(width=target_w,
-                                                     speed=self.move_max_speed,
-                                                     force=self.default_force,
-                                                     blocking=False)
-                                        current_is_open = True
+                                    # Both close and open use NON-BLOCKING goto
+                                    # so this 60 Hz polling loop doesn't stall.
+                                    # The previous code path used grasp() with
+                                    # timeout_s=2.0 for close, which blocked the
+                                    # loop for up to 2 s every gripper close
+                                    # (~120 overruns per close in the 5 s window
+                                    # after). For teleop UX this is fine because
+                                    # the daemon completes the trajectory on its
+                                    # own time and the EtherCAT slave caps the
+                                    # actual fingertip force via current limit;
+                                    # explicit force-mode grasp is still
+                                    # available via the input_queue GRASP cmd.
+                                    # Catalog #30.
+                                    gripper.goto(width=target_w,
+                                                 speed=self.move_max_speed,
+                                                 force=self.default_force,
+                                                 blocking=False)
+                                    current_is_open = (cmd == self.GRIPPER_CMD_OPEN)
                                     last_teleop_cmd = cmd
                                 except Exception as e:
                                     if self.verbose:
