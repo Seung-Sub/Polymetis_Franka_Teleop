@@ -336,6 +336,42 @@ This repo does **not** require the `groot` (training) env; only `groot-client`
 (client-side Polymetis + ZED + Vive). If you've already done Isaac-GR00T's
 INSTALL_FROM_SCRATCH §7, the training env is a bonus, not a prerequisite.
 
+### E-2. pro4000 RT tuning (one-shot install)
+
+Without this, the Franka client experiences NIC IRQ contention on
+`enp130s0` (the NUC subnet), `FrankaInterpolationController` floats across
+cores under the default scheduler, and `update_desired_joint_positions`
+calls miss libfranka's 1 ms FCI window — leading to
+`communication_constraints_violation` reflex storms (catalog #25).
+
+```bash
+cd ~/Polymetis_Franka_Teleop
+sudo bash install/install_pro4000_rt.sh
+```
+
+This installs:
+- `/usr/local/sbin/franka_client_rt_apply.sh` → systemd `franka-client-rt-tune.service`
+  pins enp130s0 NIC IRQs to cores 0-1, sets governor=performance, stops irqbalance.
+- `/etc/security/limits.d/franka_client_rt.conf` → `kist` user gets
+  rtprio=50, nice=-15, memlock=unlimited.
+- `/etc/systemd/system.conf.d/franka_rt.conf` + user.conf.d → systemd
+  default RTPRIO/NICE/MEMLOCK match (otherwise systemd's user@*.service
+  slice caps desktop-terminal RTPRIO at 0 — see catalog #33).
+
+After install, log out from the desktop and back in (or reboot once) so
+the new limits propagate to the desktop session. Verify:
+
+```bash
+ulimit -r            # expect 50 (was 0 before)
+systemctl is-active franka-client-rt-tune     # active
+cat /sys/class/net/enp130s0/queues/rx-0/rps_cpus    # expect 0003 (cores 0,1)
+```
+
+The Python multiprocessing children (FrankaInterpolationController,
+ArtGripperController, etc.) self-pin to dedicated cores via
+`polymetis_franka_teleop/common/realtime_util.py` at process start —
+no per-process taskset commands needed.
+
 ---
 
 ## Phase F — pro4000 ZED SDK + cameras
@@ -519,6 +555,12 @@ works fine over SSH after the one-time GUI pairing.
 cd ~/Polymetis_Franka_Teleop
 bash install/check_environment.sh
 # All [OK]; [WARN] for things you intentionally don't use is fine; [FAIL] is not.
+
+# Comprehensive preflight with auto-recovery (recommended every session
+# before launching the demo; run_test_session_groot_ft.sh invokes it
+# automatically). Auto-fixes: stale demo processes, hung ART daemon TCP
+# slot, missing Vive controllers, NUC :50051 down. Returns 0 if ready.
+bash bin/preflight_full.sh
 ```
 
 ### J-2. NUC reachability + Polymetis state read (no motion)

@@ -265,3 +265,240 @@ the demo dies, freeing the shell.
 
 If you don't want this behavior, run `bash bin/start_teleop.sh …` directly
 without the launcher.
+
+---
+
+## Stabilization catalog (2026-05-09 KIST teleop session)
+
+### #25 — Reflex cascade after recovery (8-13 reflex storms in 1.5 min window)
+
+**Symptom**: After the first `communication_constraints_violation` reflex,
+recoveries fire every ~3 s for 1-2 min before settling. User experience:
+robot stuck for tens of seconds even though each individual recovery is fast.
+
+**Root cause (multiple stacked)**:
+1. Pro4000 NIC IRQ for the NUC subnet was floating across CPUs 3 + 12
+   (default IRQ balance). NIC softirq competes with Python compute on the
+   same cores → gRPC `update_desired_joint_positions` gets delayed →
+   libfranka 1 ms FCI window missed → reflex.
+2. Pro4000's `FrankaInterpolationController` ran on whatever core the
+   default scheduler picked. With ~8 Python multiprocessing children on a
+   14-core CPU, contention is statistical: usually fine, but bursts of
+   activity (gripper transition, ZED frame burst) push the controller off
+   schedule.
+3. `time.sleep(1.5)` in the recovery handler did NOT reset the loop's
+   `t_start` / `iter_idx` clock. After the sleep, `t_wait_util = t_start +
+   iter_idx*dt` was 1.5 s in the past → `precise_wait` returned immediately
+   → 100-150 iters fired at 250 Hz to "catch up" → polymetis HybridJoint
+   ImpedanceController got hammered with updates faster than it could
+   process → another reflex.
+
+**Fix**:
+- `install/pro4000/sbin/franka_client_rt_apply.sh` pins enp130s0 NIC IRQ
+  to cores 0,1, sets governor=performance, stops irqbalance.
+- `polymetis_franka_teleop/common/realtime_util.py` pins
+  `FrankaInterpolationController` to cores 6,7 + SCHED_RR/20, and
+  `ArtGripperController` to cores 8,9 + SCHED_RR/15.
+- `franka_vive_env.py` start() pins the main demo + general children to
+  cores 0-5 + 10-13 (away from RT cores 6-9).
+- `franka_interpolation_controller.py` recovery path resets `t_start` /
+  `iter_idx` after the impedance restart, eliminating the catch-up burst.
+- /etc/security/limits.d/franka_client_rt.conf grants rtprio=50 / nice=-15;
+  /etc/systemd/system.conf.d/franka_rt.conf sets DefaultLimitRTPRIO=50 so
+  the user's desktop session also gets the bump (was being capped at 0 by
+  systemd's user@.service slice default).
+
+**After fix**: 11 → 0 NUC-side reflexes per session at KIST.
+
+---
+
+### #26 — Stuck recovery: "Grip" not responding after reflex; only trackpad-HOME escapes
+
+**Symptom**: After a reflex+recovery, user re-engages Vive Grip and sees
+"Clutch ENGAGED", but the robot does not move. Pressing trackpad HOME makes
+the robot move to ready pose, and from there normal teleop resumes.
+
+**Root cause**: The `FrankaInterface` IK silent-failure path:
+
+```python
+joint_target, success = self.robot.solve_inverse_kinematics(...)
+if not success:
+    if self._last_good_joint_target is not None:
+        self.robot.update_desired_joint_positions(self._last_good_joint_target)
+    return
+```
+
+After a reflex, the robot is at a pose near the reflex configuration. The
+IK seed (`_cached_q`) and last-good fallback (`_last_good_joint_target`)
+both still hold the values from BEFORE the reflex. When the user moves the
+Vive controller toward a target close to the previous reflex configuration,
+IK seeds from the bad pose, fails, and the fallback path replays the same
+bad joint target every tick. Robot stays put even though Grip is engaged.
+
+`move_to_joint_positions` (the HOME path) does NOT use IK — it uses a
+trajectory tracking controller. So HOME works regardless of stuck IK. After
+HOME, both `_cached_q` and `_last_good_joint_target` are naturally
+overwritten with fresh values, and IK works again.
+
+**Fix**: `FrankaInterface.reset_ik_state()` is called explicitly on every
+recovery and after every HOME (`franka_interpolation_controller.py:reset_
+ik_state`). Forces the next IK call to re-fetch joint positions from the
+robot, breaking the stale-cache lock.
+
+---
+
+### #27 — `start_cartesian_impedance` silently fails after consecutive reflexes; user gets stuck
+
+**Symptom**: After 2-3 reflex+recovery cycles in quick succession,
+`start_cartesian_impedance(Kx, Kxd)` returns success but polymetis returns
+`Unable to update desired joint positions. Use 'start_joint_impedance' to
+start a joint impedance controller.` for every subsequent
+`update_desired_joint_positions` call. The recovery handler keeps retrying
+forever.
+
+**Root cause**: Polymetis's HybridJointImpedanceController state machine
+appears to enter a confused state when `start_cartesian_impedance` is
+called multiple times within a short window without a clean transition.
+Only `move_to_joint_positions` (a different polymetis controller path)
+forces a clean state reset that subsequent `start_cartesian_impedance`
+calls can actually take.
+
+**Fix**: Auto-HOME escalation in `franka_interpolation_controller.py`. The
+recovery handler tracks `consecutive_recovery_count`. If 2 recoveries fire
+within a 10 s window, the next iteration injects a synthetic
+`Command.MOVE_HOME` into the input queue. HOME forces the polymetis state
+reset, and `start_cartesian_impedance` works correctly afterward. User does
+not need to press trackpad HOME manually.
+
+Log signature when this fires:
+```
+[FrankaPositionalController] !! 2 recoveries in <10 s -- start_cartesian_
+impedance not taking. Auto-HOME to force polymetis state reset.
+[FrankaPositionalController] auto-HOME injected to force polymetis state
+reset (catalog #27)
+```
+
+---
+
+### #28 — Joint near-singularity reflexes (j3=2.97, j5=2.97, j6=2.89)
+
+**Symptom**: Robot reflex fires when user pushes the elbow (j3) or wrist
+(j5/j6) toward the Franka mechanical limit. NUC log shows
+`Joint velocity violation` or `joint_position_limits` alongside the
+`communication_constraints_violation`.
+
+**Root cause**: At joint angles within ~0.3 rad of the mechanical limit,
+Cartesian impedance requires high joint torque to maintain the EEF target.
+libfranka's `safety_controller` activates at lower torque thresholds in
+this regime, and small subsequent motion trips the limit.
+
+**Fix**: Joint-limit early-warning in `franka_interpolation_controller.py`
+at every iter:
+- j3 / j5 warn at |q| > 2.5 rad (margin 0.47 rad)
+- j6 warns at |q| > 2.5 rad (margin 0.39 rad)
+- Throttled to 1 message per joint per 10 s
+
+User-side mitigation: back off the corresponding joint angle. Most often
+the elbow (j3) — fold the arm back closer to the base before pushing the
+EEF further out.
+
+The cv2 status panel (`scripts_real/demo_franka_vive.py:644-672`) also
+shows live j3/j5/j6 magnitude and margin in green/amber/red color so the
+user can avoid the limit before reflex fires.
+
+---
+
+### #29 — Controller-not-ready transient race after `start_cartesian_impedance`
+
+**Symptom**: Even with no reflex on the NUC side, pro4000 sometimes sees
+`Tried to perform a controller update with no controller running` for a
+few iterations after `start_cartesian_impedance` returns.
+
+**Root cause**: `start_cartesian_impedance` returns success as soon as
+polymetis QUEUES the policy load, but the controller takes 50-400 ms more
+to actually accept commands. During that window any update is rejected.
+
+**Fix**: `FrankaInterface.wait_until_controller_ready()` polls
+`update_desired_joint_positions(current_q)` (a no-op feed since target ==
+current) until it stops raising. Replaces the previous
+`time.sleep(1.5)` blind wait. Typical latency 100-300 ms; 1.5 s timeout
+matches the previous behavior. Reduces both: false-recovery races and
+user-perceived recovery duration.
+
+---
+
+### #30 — Gripper close (`grasp(timeout_s=2.0)`) blocks the gripper loop, causes 60-100% overruns
+
+**Symptom**: Every time the user presses the Vive Trigger to close the
+ART gripper, the next 5 s of `ArtGripperController.run()` reports 100-200
+overruns/300 (33-67%) — the loop falls behind by ~2 s.
+
+**Root cause**: `art_gripper_client.ArtGripperInterface.grasp(timeout_s=
+2.0)` is a *blocking* call: it waits up to 2 s for the firmware to report
+"idle" before returning. The 60 Hz state-polling loop is single-threaded,
+so 2 s of blocking == 120 missed iterations.
+
+**Fix**: `art_gripper_controller.py` teleop close path now uses
+`gripper.goto(width=close_w, blocking=False)` instead of `grasp()`. The
+EtherCAT slave still completes the trajectory and caps fingertip force via
+the current limit, but the controller loop returns immediately. Force-mode
+grasp (i.e., closing until a force threshold is met) is still available
+via the explicit `Command.GRASP` input-queue command path.
+
+---
+
+### #31 — Stale Python child holds /dev/video0 after demo crash → next demo sees only 1 ZED
+
+**Symptom**: After a demo crash mid-init (e.g., the AttributeError race in
+catalog #29), restarting the demo shows `pyzed.sl.Camera.get_device_list()`
+returning only 1 camera even though `lsusb` shows both ZEDs.
+
+**Root cause**: The ZED SDK opens `/dev/videoN` exclusively. A leftover
+multiprocessing child from the previous failed demo still holds the file
+descriptor, blocking the new demo's open call.
+
+**Fix**: `bin/preflight_full.sh` step [1/6] kills any process matching
+`demo_franka_vive | spawn_main | cv2_viewer | FrankaPositional |
+ArtGripper | SingleZed | MultiZed | ViveTeleop` before starting. Step
+[3/6] then verifies pyzed sees both cameras; if not, falls through to a
+warning telling the user which lsof PID is holding the device.
+
+---
+
+### #32 — ART daemon TCP single-client lock held by killed previous client
+
+**Symptom**: ART daemon is `systemctl is-active` but every
+`ArtGripperInterface(...)` call times out. `ss -tn` shows several
+CLOSE-WAIT / FIN-WAIT-2 / ESTAB connections to `:50053`.
+
+**Root cause**: The ART daemon (`Hyundai_motors_Gripper/src/server.cpp`)
+serves one TCP client at a time. When a previous client process is
+SIGKILL'd while connected, the daemon's accept-loop is still blocked on
+that dead socket; new connects hang.
+
+**Fix**:
+- `bin/preflight_full.sh` step [2/6] sends an actual OP_PING (binary
+  protocol) with a 3 s timeout. If it times out, runs
+  `~/Hyundai_motors_Gripper/scripts/restart_gripper.sh` (which stops the
+  daemon, reloads the EtherCAT kmod, restarts the daemon, and re-pings).
+- The daemon-side fix would be to detect dead connections and kick them;
+  this is outside our repo, see Hyundai_motors_Gripper.
+
+---
+
+### #33 — systemd-logind caps desktop-terminal `ulimit -r` at 0 even with PAM `limits.conf`
+
+**Symptom**: `/etc/security/limits.d/franka_client_rt.conf` sets `kist - rtprio 50` but a freshly opened desktop terminal (gnome-terminal /
+ctrl+alt+t) reports `ulimit -r = 0`. SSH-to-localhost reports 50 correctly.
+
+**Root cause**: GDM/gnome-session creates a `user@1000.service` slice via
+systemd. systemd applies its own `DefaultLimitRTPRIO=0` (compile-time
+default) to processes inside the slice AFTER pam_limits.so. The desktop
+terminal inherits the slice's limit, ignoring PAM. SSH bypasses the slice
+because sshd's own session is launched outside `user@*.service`.
+
+**Fix**: drop-in `/etc/systemd/system.conf.d/franka_rt.conf` and
+`/etc/systemd/user.conf.d/franka_rt.conf` set `DefaultLimitRTPRIO=50`,
+`DefaultLimitNICE=-15`, `DefaultLimitMEMLOCK=infinity`. Takes effect on
+the next desktop logout/login. Both files installed by
+`install/install_pro4000_rt.sh`.
