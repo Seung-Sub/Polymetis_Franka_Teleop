@@ -491,6 +491,15 @@ class ViveTeleopProcess(mp.Process):
                     clutch_active = False  # Disable clutch during home
                     prev_target_pos = None
                     prev_target_rot = None
+                    # CRITICAL: clear gripper_command at HOME START so the
+                    # 2-sec HOME window does not keep publishing the stale
+                    # pre-HOME CLOSE/OPEN command into gripper_ring_buffer.
+                    # Without this, env.move_home()'s explicit goto(open_w)
+                    # gets immediately overridden in the same ART controller
+                    # iter by the stale CLOSE from Vive teleop -- gripper
+                    # closes again right after opening, and the user sees
+                    # the 3-press regression. Catalog #34.
+                    gripper_command = GripperCommand.NONE
                     if self.verbose:
                         print("[ViveTeleopProcess] HOME requested via trackpad")
 

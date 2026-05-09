@@ -263,6 +263,7 @@ class ArtGripperController(mp.Process):
                 # stop() will hang forever in teleop mode (the legacy NORMAL-
                 # mode handler at the bottom of this loop never sees it
                 # because we drained it up here).
+                explicit_fired_this_iter = False
                 try:
                     explicit_batch = self.input_queue.get_all()
                     n_explicit = len(explicit_batch.get('cmd', []))
@@ -272,6 +273,7 @@ class ArtGripperController(mp.Process):
                             keep_running = False
                             break
                         if ec == Command.GOTO.value:
+                            explicit_fired_this_iter = True
                             target_pos = float(explicit_batch['target_pos'][j])
                             speed = float(explicit_batch.get('speed', [self.move_max_speed])[j])
                             try:
@@ -302,7 +304,14 @@ class ArtGripperController(mp.Process):
                     pass
 
                 # ---- TELEOP ----
-                if self.teleop_mode:
+                # Skip when an explicit GOTO already fired this iter -- otherwise
+                # the stale gripper_command from Vive teleop (e.g. CLOSE held
+                # during a keyboard 'h' HOME or trackpad HOME's pre-reset
+                # window) would override the explicit OPEN within the same
+                # 16.6 ms loop tick. This prevents the "gripper closes
+                # immediately after env.move_home()" race that re-introduced
+                # the 3-press regression. Catalog #34.
+                if self.teleop_mode and not explicit_fired_this_iter:
                     try:
                         ts = self.teleop_ring_buffer.get()
                         teleop_ts = ts.get('teleop_timestamp', 0.0)
