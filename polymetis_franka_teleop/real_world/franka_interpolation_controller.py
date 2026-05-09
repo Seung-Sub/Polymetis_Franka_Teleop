@@ -1,8 +1,9 @@
 """
 FrankaInterpolationController for Franka robot with configurable TCP offset.
-Based on UMI's franka_interpolation_controller.py — but uses **direct
-polymetis gRPC** (no ZeroRPC indirection on NUC), matching the
-verified GR00T-side path (`Isaac-GR00T/examples/DROID/franka_env_kist.py`).
+Based on UMI's franka_interpolation_controller.py — uses direct polymetis
+gRPC to NUC :50051. The earlier ZeroRPC bridge path (UMI/DROID style) was
+removed once we confirmed the direct path was reliable; see git log for
+history if you need to revive it.
 
 Key features:
 - Runs in separate process to ensure predictable timing (avoiding Python GIL)
@@ -14,7 +15,6 @@ Key features:
 Requirements (NUC):
 - polymetis launch_robot.py running on :50051
   (start via `sudo bash /usr/local/sbin/start_franka_arm.sh`)
-- That's it — no extra ZeroRPC/wrapper layer needed.
 
 Requirements (pro4000):
 - polymetis Python client in the active conda env (already true in
@@ -107,29 +107,15 @@ tx_flange_tip = tx_flange_flangerot45 @ tx_flangerot45_flangerot90 @tx_flangerot
 tx_tip_flange = np.linalg.inv(tx_flange_tip)
 
 class FrankaInterface:
-    """TCP-frame wrapper supporting **two backend modes**:
-
-    * ``mode='zerorpc'`` (DEFAULT, community-standard) — connects to a
-      ZeroRPC bridge running on the NUC (port 4242) where the polymetis
-      Python client is local. This is the architecture used by UMI,
-      DROID/R2D2 and is the most reliable pattern for remote teleop —
-      the 4 internal gRPCs that polymetis's ``update_desired_ee_pose``
-      issues all stay loopback on the NUC.
-
-    * ``mode='direct'`` — connects polymetis client directly to the arm
-      gRPC server (port 50051). Simpler deployment (no NUC bridge needed)
-      but capped at ~100 Hz from a remote workstation before the 1 s
-      polymetis watchdog (THRESHOLD_NS) trips on NUC realtime stalls.
+    """TCP-frame wrapper around polymetis RobotInterface (direct gRPC :50051).
 
     Args:
         ip:   NUC host.
-        port: 4242 for zerorpc, 50051 for direct (must match ``mode``).
-        mode: 'zerorpc' (default) or 'direct'.
+        port: polymetis arm gRPC port (default 50051).
         tx_flange_tip_override: optional 4x4 flange→tool transform.
     """
-    def __init__(self, ip='192.168.1.12', port=50051, mode='direct',
+    def __init__(self, ip='192.168.1.12', port=50051,
                  tx_flange_tip_override=None):
-        self.mode = mode
         self._cached_q = None
         # Last joint target that successfully passed IK. We send this to
         # polymetis whenever a fresh IK call fails so the NUC keeps receiving
@@ -142,17 +128,8 @@ class FrankaInterface:
         # so we throttle the warning rate without throttling the recovery.
         self._last_ik_stuck_warn_t = 0.0
 
-        if mode == 'zerorpc':
-            import zerorpc
-            self._rpc = zerorpc.Client(heartbeat=20)
-            self._rpc.connect(f'tcp://{ip}:{port}')
-            self.robot = None  # not used in zerorpc mode
-        elif mode == 'direct':
-            from polymetis import RobotInterface
-            self.robot = RobotInterface(ip_address=ip, port=port)
-            self._rpc = None
-        else:
-            raise ValueError(f"FrankaInterface mode must be 'zerorpc' or 'direct', got {mode!r}")
+        from polymetis import RobotInterface
+        self.robot = RobotInterface(ip_address=ip, port=port)
 
         if tx_flange_tip_override is not None:
             self.tx_flange_tip = tx_flange_tip_override
@@ -181,10 +158,6 @@ class FrankaInterface:
 
         Catalog #29.
         """
-        if self.mode == 'zerorpc':
-            # Nothing to poll — bridge handles its own state
-            time.sleep(0.3)
-            return True
         deadline = time.monotonic() + max_wait_s
         while time.monotonic() < deadline:
             try:
@@ -217,8 +190,6 @@ class FrankaInterface:
     # ----- low-level state -----
     def _flange_pose_6d(self):
         """Returns flange pose [x,y,z,rx,ry,rz] (axis-angle)."""
-        if self.mode == 'zerorpc':
-            return np.asarray(self._rpc.get_ee_pose(), dtype=np.float64)
         pos, quat = self.robot.get_ee_pose()
         rotvec = st.Rotation.from_quat(quat.numpy()).as_rotvec()
         return np.concatenate([pos.numpy(), rotvec])
@@ -228,20 +199,13 @@ class FrankaInterface:
         return mat_to_pose(pose_to_mat(flange) @ self.tx_flange_tip)
 
     def get_joint_positions(self):
-        if self.mode == 'zerorpc':
-            return np.asarray(self._rpc.get_joint_positions(), dtype=np.float64)
         return self.robot.get_joint_positions().numpy()
 
     def get_joint_velocities(self):
-        if self.mode == 'zerorpc':
-            return np.asarray(self._rpc.get_joint_velocities(), dtype=np.float64)
         return self.robot.get_joint_velocities().numpy()
 
     # ----- control -----
     def move_to_joint_positions(self, positions: np.ndarray, time_to_go: float):
-        if self.mode == 'zerorpc':
-            self._rpc.move_to_joint_positions(np.asarray(positions).tolist(), float(time_to_go))
-            return
         import torch
         self.robot.move_to_joint_positions(
             positions=torch.Tensor(np.asarray(positions, dtype=np.float32)),
@@ -249,9 +213,6 @@ class FrankaInterface:
         )
 
     def start_cartesian_impedance(self, Kx: np.ndarray, Kxd: np.ndarray):
-        if self.mode == 'zerorpc':
-            self._rpc.start_cartesian_impedance(np.asarray(Kx).tolist(), np.asarray(Kxd).tolist())
-            return
         import torch
         self.robot.start_cartesian_impedance(
             Kx=torch.Tensor(np.asarray(Kx, dtype=np.float32)),
@@ -261,15 +222,10 @@ class FrankaInterface:
     def update_desired_ee_pose(self, tip_pose: np.ndarray):
         """Convert TCP-frame target → flange-frame target → robot.
 
-        zerorpc mode: 1 ZeroRPC call to NUC bridge (which does IK + polymetis
-            update locally on NUC — community-standard UMI/DROID path).
-        direct mode: solve IK locally, then 1 polymetis gRPC for the joint
-            update (3× fewer RPCs than polymetis's default update_desired_ee_pose).
+        Solves IK locally, then issues 1 polymetis gRPC for the joint
+        update (3× fewer RPCs than polymetis's default update_desired_ee_pose).
         """
         flange_pose = mat_to_pose(pose_to_mat(tip_pose) @ self.tx_tip_flange)
-        if self.mode == 'zerorpc':
-            self._rpc.update_desired_ee_pose(flange_pose.tolist())
-            return
         import torch
         pos = flange_pose[:3]
         quat = st.Rotation.from_rotvec(flange_pose[3:]).as_quat()
@@ -322,27 +278,18 @@ class FrankaInterface:
         self.robot.update_desired_joint_positions(joint_target)
 
     def set_cached_q(self, q):
-        """Optional: feed cached joint state for IK seed (direct mode only)."""
-        if self.mode == 'direct':
-            import torch
-            self._cached_q = torch.as_tensor(q, dtype=torch.float32)
+        """Optional: feed cached joint state for IK seed."""
+        import torch
+        self._cached_q = torch.as_tensor(q, dtype=torch.float32)
 
     def terminate_current_policy(self):
         try:
-            if self.mode == 'zerorpc':
-                self._rpc.terminate_current_policy()
-            else:
-                self.robot.terminate_current_policy()
+            self.robot.terminate_current_policy()
         except Exception:
             pass
 
     def close(self):
-        if self.mode == 'zerorpc':
-            try: self._rpc.close()
-            except Exception: pass
-            self._rpc = None
-        else:
-            self.robot = None
+        self.robot = None
 
 
 class FrankaInterpolationController(mp.Process):
@@ -382,8 +329,7 @@ class FrankaInterpolationController(mp.Process):
     def __init__(self,
         shm_manager: SharedMemoryManager,
         robot_ip,
-        robot_port=50051,                     # 50051 for direct, 4242 for zerorpc
-        polymetis_mode: str = 'direct',       # 'direct' (default) or 'zerorpc' (UMI/DROID bridge)
+        robot_port=50051,
         frequency=100,                         # 100 Hz is the empirically stable ceiling on this NUC
         tcp_offset: float = 0.1034,
         use_wsg_gripper: bool = False,
@@ -419,7 +365,6 @@ class FrankaInterpolationController(mp.Process):
         super().__init__(name="FrankaPositionalController")
         self.robot_ip = robot_ip
         self.robot_port = robot_port
-        self.polymetis_mode = polymetis_mode
         self.frequency = frequency
         self.tcp_offset = tcp_offset
         self.use_wsg_gripper = use_wsg_gripper
@@ -599,11 +544,10 @@ class FrankaInterpolationController(mp.Process):
             use_wsg_gripper=self.use_wsg_gripper
         )
 
-        # start polymetis interface with configurable TCP transform + backend mode
+        # start polymetis interface with configurable TCP transform
         robot = FrankaInterface(
             ip=self.robot_ip,
             port=self.robot_port,
-            mode=self.polymetis_mode,
             tx_flange_tip_override=tx_flange_tip_local,
         )
 
@@ -623,13 +567,11 @@ class FrankaInterpolationController(mp.Process):
                       f" — terminating any stale controller, then move_to_joint_positions"
                       f"(time_to_go={self.joints_init_duration}s)...", flush=True)
                 try:
-                    if robot.mode != 'zerorpc' and hasattr(robot, 'robot'):
-                        # 'direct' mode: robot.robot is the polymetis RobotInterface.
-                        try:
-                            robot.robot.terminate_current_policy()
-                            time.sleep(0.3)
-                        except Exception:
-                            pass  # no policy was running — fine
+                    try:
+                        robot.robot.terminate_current_policy()
+                        time.sleep(0.3)
+                    except Exception:
+                        pass  # no policy was running — fine
                     q_before = robot.get_joint_positions()
                     robot.move_to_joint_positions(
                         positions=np.asarray(self.joints_init),
@@ -966,22 +908,11 @@ class FrankaInterpolationController(mp.Process):
                         if self.verbose:
                             print(f"[FrankaPositionalController] Update error: {e}")
 
-                # update robot state — under ZeroRPC, prefer single batched
-                # call (get_robot_state) so the bridge collapses 3 polymetis
-                # internal-gRPC bursts into one. Falls back to per-key fetch.
+                # update robot state via per-key polymetis fetch
                 state = dict()
                 try:
-                    if robot.mode == 'zerorpc':
-                        rs = robot._rpc.get_robot_state()
-                        state['ActualTCPPose'] = mat_to_pose(
-                            pose_to_mat(np.asarray(rs['ee_pose'], dtype=np.float64))
-                            @ robot.tx_flange_tip
-                        )
-                        state['ActualQ']  = np.asarray(rs['q'],  dtype=np.float64)
-                        state['ActualQd'] = np.asarray(rs['qd'], dtype=np.float64)
-                    else:
-                        for key, func_name in self.receive_keys:
-                            state[key] = getattr(robot, func_name)()
+                    for key, func_name in self.receive_keys:
+                        state[key] = getattr(robot, func_name)()
                 except Exception as e:
                     if self.verbose and iter_idx % 100 == 0:
                         print(f"[FrankaPositionalController] State read error: {e}")

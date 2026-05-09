@@ -93,8 +93,7 @@ class ViveTeleopProcess(mp.Process):
             shm_manager: SharedMemoryManager,
             vive_ring_buffer,  # SharedMemoryRingBuffer from ViveSharedMemory
             robot_ip: str,
-            robot_port: int = 50051,           # 50051 direct / 4242 zerorpc
-            polymetis_mode: str = 'direct',    # match FrankaInterpolationController
+            robot_port: int = 50051,
             frequency: int = 100,
             pos_scale: float = 1.0,
             rot_scale: float = 1.0,
@@ -126,7 +125,6 @@ class ViveTeleopProcess(mp.Process):
         self.vive_ring_buffer = vive_ring_buffer
         self.robot_ip = robot_ip
         self.robot_port = robot_port
-        self.polymetis_mode = polymetis_mode
         self.frequency = frequency
         self.pos_scale = pos_scale
         self.rot_scale = rot_scale
@@ -348,11 +346,10 @@ class ViveTeleopProcess(mp.Process):
         from polymetis_franka_teleop.common.pose_util import pose_to_mat, mat_to_pose
 
         try:
-            # Use FrankaInterface so we share the polymetis_mode dispatch
-            # (zerorpc bridge vs direct gRPC) with FrankaInterpolationController.
+            # Reuse FrankaInterface (direct polymetis :50051) for state reads.
             from polymetis_franka_teleop.real_world.franka_interpolation_controller import FrankaInterface
             robot_client = FrankaInterface(
-                ip=self.robot_ip, port=self.robot_port, mode=self.polymetis_mode,
+                ip=self.robot_ip, port=self.robot_port,
             )
 
             def _flange_pose_6d():

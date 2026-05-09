@@ -140,16 +140,11 @@ class FrankaViveEnv:
             robot_obs_horizon=2,
             gripper_obs_horizon=2,
             # robot params
-            # KIST default: polymetis-direct mode = simpler deployment (no NUC bridge needed),
-            # cleaner architecture for our hardware. ZeroRPC bridge is preserved as opt-in via
-            # polymetis_mode='zerorpc' + robot_port=4242 (UMI/DROID-style remote teleop).
-            polymetis_mode='direct',   # 'direct' (default, polymetis :50051) or 'zerorpc' (UMI/DROID bridge :4242)
-            robot_port=50051,          # 50051 for direct, 4242 for zerorpc
-            gripper_port=4242,
-            robot_frequency=100,       # KIST: 100 Hz is the empirically stable ceiling on this NUC
-                                       # (both zerorpc and direct modes; >150 Hz trips the polymetis 1s watchdog
-                                       # because NUC realtime thread can't keep up under combined gRPC+IK load).
-                                       # UMI uses 200 Hz on a faster RT NUC — bump if your NUC supports it.
+            robot_port=50051,
+            gripper_port=4242,         # Franka Hand polymetis service port (zerorpc); ART ignores this
+            robot_frequency=100,       # 100 Hz is the empirically stable ceiling on this NUC
+                                       # (>150 Hz trips the polymetis 1s watchdog because the NUC RT
+                                       # thread can't keep up under combined gRPC+IK load).
             tcp_offset=None,
             init_joints=None,             # explicit ready-pose override; None → compute from data_format
             # data_format determines the ready (home) joint pose:
@@ -369,7 +364,6 @@ class FrankaViveEnv:
             vive_ring_buffer=vive.ring_buffer,
             robot_ip=robot_ip,
             robot_port=robot_port,
-            polymetis_mode=polymetis_mode,
             frequency=teleop_frequency,
             pos_scale=pos_scale,
             rot_scale=rot_scale,
@@ -393,7 +387,6 @@ class FrankaViveEnv:
             shm_manager=shm_manager,
             robot_ip=robot_ip,
             robot_port=robot_port,
-            polymetis_mode=polymetis_mode,
             frequency=robot_frequency,
             tcp_offset=tcp_offset,
             use_wsg_gripper=False,

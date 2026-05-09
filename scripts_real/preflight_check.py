@@ -371,10 +371,10 @@ def check_robot_connection(robot_ip: str = '192.168.1.12', robot_port: int = 500
                      f"(q[0]={q[0]:.2f}, ee_xyz=[{ee_pos[0]:.2f},{ee_pos[1]:.2f},{ee_pos[2]:.2f}])", 'ok')
         return True
     except ImportError:
-        # polymetis client not in this env (zerorpc-only flow). TCP-reachable
-        # is the best we can do.
-        print_status(f"Polymetis arm reachable; client not importable here "
-                     f"(ok for --polymetis_mode zerorpc)", 'ok')
+        # polymetis client not installed in this env. TCP reachability is the
+        # best we can do — install the polymetis Python client to get a deeper
+        # pose-read probe at preflight time.
+        print_status("Polymetis arm reachable; client not importable here", 'warn')
         return True
     except Exception as e:
         print_status(f"Polymetis read probe failed: {type(e).__name__}: {e}", 'error')

@@ -16,15 +16,15 @@ else
     warn "conda env 'groot-client' not found — adapt scripts to your env"
 fi
 
-# 2. polymetis client (pro4000 side, used by 'direct' mode only — optional under zerorpc)
+# 2. polymetis client (pro4000 side, talks to NUC :50051 directly)
 ${CONDA_PREFIX:-${HOME}/anaconda3/envs/groot-client}/bin/python -c "import polymetis" 2>/dev/null \
-    && ok "polymetis client (pro4000 side, optional)" \
-    || warn "polymetis client missing — required only for --polymetis_mode direct"
+    && ok "polymetis client" \
+    || fail "polymetis client missing — install fairo-polymetis"
 
-# 3. zerorpc
+# 3. zerorpc (only used by --gripper_backend franka to reach the Franka Hand service :4242)
 ${CONDA_PREFIX:-${HOME}/anaconda3/envs/groot-client}/bin/python -c "import zerorpc" 2>/dev/null \
-    && ok "zerorpc" \
-    || fail "zerorpc missing — pip install zerorpc"
+    && ok "zerorpc (needed only for Franka Hand gripper backend)" \
+    || warn "zerorpc missing — required only for --gripper_backend franka"
 
 # 4. ZED SDK + pyzed
 ${CONDA_PREFIX:-${HOME}/anaconda3/envs/groot-client}/bin/python -c "import pyzed.sl" 2>/dev/null \

@@ -100,9 +100,8 @@ class FrankaPolicyEnv:
             output_dir,
             robot_ip,
             # env params
-            polymetis_mode='direct',   # 'direct' (default) or 'zerorpc' (UMI/DROID bridge)
-            robot_port=50051,          # 50051 for direct, 4242 for zerorpc
-            gripper_port=4242,
+            robot_port=50051,
+            gripper_port=4242,         # Franka Hand polymetis service port (zerorpc); ART ignores this
             frequency=10,
             # camera params
             camera_serial_numbers=None,
@@ -293,7 +292,6 @@ class FrankaPolicyEnv:
             shm_manager=shm_manager,
             robot_ip=robot_ip,
             robot_port=robot_port,
-            polymetis_mode=polymetis_mode,
             frequency=robot_frequency,
             tcp_offset=tcp_offset,
             use_wsg_gripper=False,

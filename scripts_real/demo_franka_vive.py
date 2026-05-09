@@ -80,10 +80,8 @@ def run_preflight_check(expected_cameras: int = 2):
 @click.option('--output', '-o', required=True, help='Output directory for data')
 @click.option('--robot_ip', default='192.168.1.12', help='Robot NUC IP address (KIST default)')
 @click.option('--robot_port', default=50051, help='Polymetis arm gRPC port (NUC)')
-@click.option('--polymetis_mode', default='direct',
-              type=click.Choice(['direct', 'zerorpc']),
-              help='direct = pro4000 → NUC :50051 gRPC (default, KIST). '
-                   'zerorpc = pro4000 → unified bridge :4242 (UMI/DROID).')
+@click.option('--gripper_port', default=4242, type=int,
+              help='Franka Hand polymetis service port (zerorpc :4242). Ignored for ART backend.')
 @click.option('--vive_host', default='127.0.0.1', help='Vive input server host')
 @click.option('--vive_port', default=12345, help='Vive input server port')
 @click.option('--camera_backend', default='zed', type=click.Choice(['zed', 'realsense']),
@@ -147,7 +145,7 @@ def run_preflight_check(expected_cameras: int = 2):
                    'encoding consumes too much CPU.')
 @click.option('--skip_preflight', is_flag=True, default=False, help='Skip preflight check')
 @click.option('--verbose', '-v', is_flag=True, default=False, help='Enable verbose output')
-def main(output, robot_ip, robot_port, polymetis_mode, vive_host, vive_port,
+def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
          camera_backend, gripper_backend, art_gripper_host, art_gripper_port,
          camera_serials, camera_resolution, camera_fps, obs_resolution,
          vis_camera_idx, show_all_cameras, frequency, teleop_frequency,
@@ -239,8 +237,7 @@ def main(output, robot_ip, robot_port, polymetis_mode, vive_host, vive_port,
                 output_dir=output,
                 robot_ip=robot_ip,
                 robot_port=robot_port,
-                polymetis_mode=polymetis_mode,
-                gripper_port=robot_port,
+                gripper_port=gripper_port,
                 frequency=frequency,
                 camera_backend=camera_backend,
                 gripper_backend=gripper_backend,
