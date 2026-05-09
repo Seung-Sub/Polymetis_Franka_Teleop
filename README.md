@@ -162,24 +162,33 @@ python examples/check_recording.py data/pap
 
 ## Latency calibration
 
-Defaults baked into env (calibrated on KIST hardware):
+All per-channel latency constants live in [`install/latency_calibration.json`](install/latency_calibration.json) and are loaded automatically by `FrankaViveEnv` / `FrankaPolicyEnv` at construction time (with hardcoded V3 fallbacks if the file is missing). Backend-aware: the ZED camera and the ART gripper carry their own keys.
+
+Current defaults (V3 2026-01-25, RealSense + Franka Hand calibrated; ZED + ART use placeholder values until the new calibrators are run):
 
 | Channel | Latency | Source |
 |---|---|---|
-| Camera obs | 15 ms | hardware timestamp + receive_latency |
+| Camera obs (RealSense) | 15 ms | hardware timestamp |
+| Camera obs (ZED) | 15 ms | placeholder — run `calibrate_zed_latency.py` |
 | Robot obs | 1 ms | round-trip / 2 |
-| Gripper obs | 1 ms | round-trip / 2 |
+| Gripper obs (Franka) | 1 ms | ZeroRPC round-trip / 2 |
+| Gripper obs (ART) | 1 ms | placeholder — run `calibrate_art_gripper_latency.py` |
 | Robot action | 55 ms | schedule_waypoint → arrival |
 | Gripper action (Franka) | 85 ms | direct ZeroRPC |
-| Gripper action (ART) | 85 ms | direct TCP — re-measure if needed |
+| Gripper action (ART) | 85 ms | placeholder — run `calibrate_art_gripper_latency.py` |
 
-Re-measure on hardware change:
+Re-measure on hardware change. Each calibrator prints stats and (with `--patch`, the default) writes the measured value back into `install/latency_calibration.json` so subsequent recordings pick it up automatically:
 
 ```bash
+# Existing (Franka Hand + RealSense paths)
 python scripts_real/calibrate_franka_robot_latency.py
 python scripts_real/calibrate_franka_gripper_latency.py
-python scripts_real/calibrate_realsense_latency.py    # template for ZED (latency is similar)
+python scripts_real/calibrate_realsense_latency.py
 python scripts_real/calibrate_all_latencies.py        # orchestrator
+
+# NEW for ZED + ART (KIST-specific paths)
+python scripts_real/calibrate_zed_latency.py --serial 33538770 --serial 11667817
+python scripts_real/calibrate_art_gripper_latency.py
 ```
 
 ## Policy eval

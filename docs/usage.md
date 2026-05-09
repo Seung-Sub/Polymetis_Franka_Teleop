@@ -130,15 +130,24 @@ on a feature you aren't using is fine.
 
 ## 4. Data collection
 
-The default wrapper runs `demo_franka_vive.py` with KIST defaults
-(ART + ZED + Vive, 10 Hz main loop, 100 Hz Vive poll, 60 fps cameras
-at native VGA 672×376):
+Pick the wrapper that matches your downstream training target:
+
+| Wrapper | Use for | Main-loop Hz | `--data_format` | Notes |
+|---|---|---|---|---|
+| `bin/start_teleop.sh`               | UMI / Diffusion Policy fine-tune | 10 | (demo default `groot`) | Native UMI Zarr cadence |
+| `bin/start_teleop_groot_droid_ft.sh` | **GR00T-DROID fine-tune**       | **15** | **`groot`** | Matches `demo_data/droid_sample` (15 fps) so the post-trained DROID checkpoint sees the same temporal spacing during fine-tune as during pretraining |
+
+Both wrappers default to: ART gripper, 2× ZED (672×376 native VGA @ 60 fps),
+Vive teleop, 100 Hz interpolation controller, 60 Hz gripper polling.
 
 ```bash
-# Basic — output dir is the only required arg
+# UMI / Diffusion Policy collection
 bash bin/start_teleop.sh ~/Polymetis_Franka_Teleop/data/$(date +%Y%m%d_%H%M%S)
 
-# With teleop-feel preset (see teleop_tuning.md)
+# GR00T-DROID-FT collection
+bash bin/start_teleop_groot_droid_ft.sh ~/Polymetis_Franka_Teleop/data/$(date +%Y%m%d_%H%M%S)
+
+# With teleop-feel preset (see teleop_tuning.md) — works with either wrapper
 bash bin/start_teleop.sh ~/Polymetis_Franka_Teleop/data/$(date +%Y%m%d_%H%M%S) \
     --tuning_preset precise
 
@@ -149,8 +158,18 @@ python scripts_real/demo_franka_vive.py \
     --camera_backend zed --gripper_backend art \
     --camera_serials 33538770 --camera_serials 11667817 \
     --camera_resolution 1280x720 --camera_fps 30 \
+    --data_format groot --frequency 15 \
     -v
 ```
+
+### Recording-time metadata is auto-saved
+
+Both wrappers write the recording config (`data_format`, `gripper_backend`,
+`camera_backend`, `frequency`, `gripper_max_width`, `gripper_close_width`,
+plus the in-effect latency constants) into `replay_buffer.zarr/meta/.attrs`.
+The converters then read those values, so you don't have to remember
+which `--gripper_max_width` to pass at conversion time — it's always
+correct.
 
 ### Hands-off "test session" mode
 
@@ -240,11 +259,27 @@ python scripts_real/convert_franka_vive_to_umi_format.py \
 ### GR00T LeRobot v2 (DROID embodiment)
 
 ```bash
+# gripper_max_width + fps + episode_tasks all auto-loaded from
+# replay_buffer.zarr/meta/.attrs that was written at collection time, so
+# you only need --task if you didn't supply it during recording.
+python scripts_real/convert_to_gr00t_lerobot.py \
+    -i ./data/pap_groot_droid_ft \
+    -o ./data/pap_gr00t
+
+# Or, override anything explicitly (CLI wins over zarr meta):
 python scripts_real/convert_to_gr00t_lerobot.py \
     -i ./data/pap \
     -o ./data/pap_gr00t \
     -t "Pick up the yellow cup" \
-    --gripper_max_width 0.100        # ART: 0.100 ; Franka Hand: 0.080
+    --gripper_max_width 0.100  --fps 15
+```
+
+The converter prints exactly which value came from where:
+
+```
+[convert] gripper_max_width = 0.0950 (from zarr meta)
+[convert] fps = 15 (from zarr meta)
+[convert] using per-episode tasks from zarr meta (24 entries, 3 unique)
 ```
 
 Output is directly fine-tunable:
@@ -258,6 +293,13 @@ uv run python gr00t/experiment/launch_finetune.py \
     --num-gpus 1 --output-dir /tmp/franka_finetune \
     --max-steps 5000 --global-batch-size 32
 ```
+
+> **Why the GR00T-DROID-FT wrapper sets `--frequency 15`:** GR00T's
+> public DROID demo data (`Isaac-GR00T/demo_data/droid_sample/`) is 15
+> fps; its action chunks were trained on 1/15 s temporal spacing.
+> Recording at 10 Hz and labelling the dataset as 15 fps in
+> `meta/info.json` would create temporal aliasing. The wrapper avoids
+> the trap by recording at 15 Hz natively.
 
 ---
 
