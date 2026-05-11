@@ -295,8 +295,18 @@ class SingleZed(mp.Process):
             # F2: per-recording frame-timestamp accumulator + sidecar npy
             # path (populated on START_RECORDING, dumped + cleared on
             # STOP_RECORDING). ``None`` = not currently recording.
-            recording_frame_times = None
-            recording_sidecar_path = None
+            #
+            # ``recording_start_time`` / ``recording_next_global_idx`` mirror
+            # the accumulator inside ``video_recorder.write_frame`` so the
+            # npy length matches the mp4 frame count even when the
+            # recorder repeats a frame to fill an fps-grid gap (a single
+            # write_frame call can mux ``n_repeats > 1`` mp4 frames; see
+            # ``video_recorder.py:155-175``). Without this mirror, npy is
+            # consistently short whenever capture lags the fps grid.
+            recording_frame_times    = None
+            recording_sidecar_path   = None
+            recording_start_time     = None
+            recording_next_global_idx = 0
             mat = sl.Mat()
             rt = sl.RuntimeParameters()
             # 1-second moving-window FPS counter — instantaneous 1/Δt prints
@@ -366,8 +376,29 @@ class SingleZed(mp.Process):
                     # obs_native, so downstream tooling can align mp4 frames
                     # against robot data without relying on mp4 PTS (which
                     # is encoder-generated and may not match capture).
+                    #
+                    # Mirror video_recorder's internal accumulator so each
+                    # mp4 frame gets a matching npy entry, even when the
+                    # recorder repeats one capture into multiple grid slots
+                    # (n_repeats > 1). When start_time is None the recorder
+                    # disables the accumulator and emits exactly one mp4
+                    # frame per write_frame -- match that with a plain
+                    # append.
                     if recording_frame_times is not None:
-                        recording_frame_times.append(calibrated_time)
+                        if recording_start_time is not None:
+                            local_idxs, _, recording_next_global_idx = (
+                                get_accumulate_timestamp_idxs(
+                                    timestamps=[calibrated_time],
+                                    start_time=recording_start_time,
+                                    dt=1.0 / float(self.video_recorder.fps),
+                                    next_global_idx=recording_next_global_idx,
+                                )
+                            )
+                            n_repeats = len(local_idxs)
+                        else:
+                            n_repeats = 1
+                        for _ in range(n_repeats):
+                            recording_frame_times.append(calibrated_time)
 
                 # Commands
                 try:
@@ -411,6 +442,11 @@ class SingleZed(mp.Process):
                         # sidecar inside the same episode dir means
                         # drop_episode's rmtree wipes it automatically.
                         recording_frame_times = []
+                        # Reset the mirrored accumulator. ``recording_start_time``
+                        # mirrors the value passed to video_recorder so the
+                        # n_repeats computation tracks exactly the same fps grid.
+                        recording_start_time     = None if st < 0 else st
+                        recording_next_global_idx = 0
                         import os as _os
                         mp4_dir = _os.path.dirname(path)
                         mp4_base = _os.path.splitext(_os.path.basename(path))[0]
@@ -438,8 +474,10 @@ class SingleZed(mp.Process):
                                 print(f'[SingleZed {self.serial_number}] '
                                       f'WARN: could not write frame_timestamps '
                                       f'sidecar: {e}', flush=True)
-                        recording_frame_times = None
-                        recording_sidecar_path = None
+                        recording_frame_times    = None
+                        recording_sidecar_path   = None
+                        recording_start_time     = None
+                        recording_next_global_idx = 0
                     elif cmd == Command.RESTART_PUT.value:
                         put_idx = None
                         put_start_time = float(commands['put_start_time'][i])
