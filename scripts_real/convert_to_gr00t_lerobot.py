@@ -1,3 +1,6 @@
+# DEPRECATED: replaced by scripts_real/convert_to_gr00t_droid.py (Batch 2 Phase 2-1).
+# This file is kept for reference until the full converter suite (DP, ACT)
+# lands and a unified cleanup pass is done.  Do not extend it.
 """Convert Polymetis_Franka_Teleop data → GR00T LeRobot v2.0 dataset.
 
 Targets the OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT embodiment so that the
