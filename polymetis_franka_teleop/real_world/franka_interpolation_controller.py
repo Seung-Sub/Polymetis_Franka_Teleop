@@ -346,6 +346,13 @@ class FrankaInterpolationController(mp.Process):
         teleop_ring_buffer: SharedMemoryRingBuffer = None,
         home_joints: np.ndarray = None,
         home_time: float = 2.0,
+        # Optional SharedNDArray reference (shape (1,) uint8). When this
+        # controller decides on its own to MOVE_HOME (catalog #27 auto-HOME
+        # escalation after consecutive recoveries), it writes 1 here so the
+        # Vive process can mirror the move with a synthesized action lerp,
+        # keeping the recorded action stream continuous through the
+        # autonomous joint-space motion.
+        external_home_request_array=None,
         ):
 
         # Home position configuration
@@ -353,6 +360,7 @@ class FrankaInterpolationController(mp.Process):
             self.home_joints = np.array(home_joints)
         else:
             self.home_joints = FRANKA_HOME_JOINTS.copy()
+        self.external_home_request_array = external_home_request_array
 
         if joints_init is not None:
             joints_init = np.array(joints_init)
@@ -986,6 +994,15 @@ class FrankaInterpolationController(mp.Process):
                     commands = {'cmd': [Command.MOVE_HOME.value],
                                 'duration': [2.0]}
                     n_cmd = 1
+                    # Mirror the move in the Vive process's HOME state machine
+                    # so the synthesized action lerp fires (catalog #27 path
+                    # used to bypass synthesis -- action would freeze at the
+                    # user's last grip-on pose while obs moved to home).
+                    if self.external_home_request_array is not None:
+                        try:
+                            self.external_home_request_array.get()[0] = 1
+                        except Exception:
+                            pass
                     print("[FrankaPositionalController] auto-HOME injected to "
                           "force polymetis state reset (catalog #27)", flush=True)
 

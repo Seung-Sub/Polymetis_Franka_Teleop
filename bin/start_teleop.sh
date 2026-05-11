@@ -23,6 +23,7 @@ exec python scripts_real/demo_franka_vive.py \
     --camera_serials 33538770 --camera_serials 11667817 \
     --camera_resolution 672x376 --camera_fps 60 \
     --frequency 10 --teleop_frequency 100 \
+    --data_format diffusion \
     -v "$@"
 # Camera defaults: ZED native VGA (672x376) at 60 fps.
 #   Bandwidth: ~46 MB/s/cam, 23% USB 3.0 utilization for the pair (vs 80%

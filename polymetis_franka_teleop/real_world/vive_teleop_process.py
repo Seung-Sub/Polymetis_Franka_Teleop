@@ -40,9 +40,10 @@ import numpy as np
 import time
 import enum
 from multiprocessing.managers import SharedMemoryManager
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as R, Slerp
 
 from polymetis_franka_teleop.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
+from polymetis_franka_teleop.shared_memory.shared_ndarray import SharedNDArray
 
 
 class GripperCommand(enum.Enum):
@@ -111,6 +112,7 @@ class ViveTeleopProcess(mp.Process):
             rotation_limit: float = 90.0,  # Max rotation from initial pose in degrees (±limit)
             trackpad_touch_threshold: float = 0.1,  # Threshold for detecting trackpad touch
             trackpad_rotation_threshold: float = 0.7,  # Trackpad Y threshold for rotation
+            home_duration: float = 2.0,  # seconds — must match controller's home_time
             verbose: bool = False
         ):
         super().__init__(name="ViveTeleopProcess")
@@ -135,7 +137,42 @@ class ViveTeleopProcess(mp.Process):
         self.tcp_offset = tcp_offset
         self.gripper_open_width = gripper_open_width
         self.gripper_close_width = gripper_close_width
+        self.home_duration = float(home_duration)
         self.verbose = verbose
+
+        # SharedNDArray for the synthesized-action HOME target. Main process
+        # writes it once after env.start_wait() (when the robot has just
+        # auto-homed); this process reads it on every trackpad-HOME to lerp
+        # action target_pose from the user's last intent → home pose. A norm
+        # of 0 means "not yet known", in which case we fall back to the
+        # observation-following behaviour for that one HOME event.
+        self.home_target_pose_array = SharedNDArray.create_from_shape(
+            mem_mgr=shm_manager, shape=(6,), dtype=np.float64,
+        )
+        # Initialize the 6-vec to zeros (so .norm() == 0 means "not set").
+        self.home_target_pose_array.get()[:] = 0.0
+
+        # External HOME request flag (1 byte). Producers — env.move_home()
+        # for keyboard 'h' / cv2 SIGHUP, FrankaInterpolationController for
+        # catalog #27 auto-HOME escalation — set this to 1. The Vive process
+        # picks it up on the next iteration, treats it as a synthetic
+        # trackpad-press, and runs the same lerp/slerp HOME synthesis so the
+        # recorded action stream stays continuous regardless of which path
+        # triggered the move.
+        self.external_home_request_array = SharedNDArray.create_from_shape(
+            mem_mgr=shm_manager, shape=(1,), dtype=np.uint8,
+        )
+        self.external_home_request_array.get()[0] = 0
+
+        # External re-sync flag: producer (env.start_wait) sets this after
+        # auto-home completes so the Vive process replaces its stale
+        # ``target_pose`` (initialised pre-auto-home) with the robot's
+        # actual current TCP pose. Eliminates the pre-first-grip mismatch
+        # between recorded action and obs.
+        self.external_target_resync_array = SharedNDArray.create_from_shape(
+            mem_mgr=shm_manager, shape=(1,), dtype=np.uint8,
+        )
+        self.external_target_resync_array.get()[0] = 0
 
         # Create ring buffer for action output (for Main Process - UMI style)
         # gripper_state: 0=open, 1=closed (discrete toggle state)
@@ -208,6 +245,39 @@ class ViveTeleopProcess(mp.Process):
         """Check if clutch (grip) is currently active."""
         state = self.action_ring_buffer.get()
         return bool(state['clutch_active'])
+
+    def set_home_target_pose(self, pose: np.ndarray) -> None:
+        """Provide the TCP pose corresponding to the canonical home joints.
+
+        The env should call this *after* startup auto-home completes (i.e.
+        right after ``robot.start_wait()`` returns), passing the robot's
+        actual ``ActualTCPPose`` at that moment. The run loop then uses this
+        as the lerp/slerp endpoint when synthesizing the action trajectory
+        during trackpad-triggered HOME events.
+
+        Args:
+            pose: 6-vec [x, y, z, rx, ry, rz] (axis-angle), TCP frame.
+        """
+        pose = np.asarray(pose, dtype=np.float64)
+        assert pose.shape == (6,), f'home pose shape {pose.shape} != (6,)'
+        self.home_target_pose_array.get()[:] = pose
+
+    def request_home_synthesis(self) -> None:
+        """Ask the Vive process to enter HOME synthesis on its next iter.
+
+        Callable from the main process / from controller subprocesses that
+        hold a reference to ``external_home_request_array``. The flag is
+        consumed (cleared) by the Vive process once seen, so callers don't
+        need to reset it. Multiple back-to-back calls collapse — only one
+        HOME synthesis fires per consumption."""
+        self.external_home_request_array.get()[0] = 1
+
+    def sync_target_pose_to_current_robot(self) -> None:
+        """Force the Vive process's internal target_pose to match the
+        robot's current TCP pose on its next iter. Used by env.start_wait()
+        right after auto-home so the first recorded action sample doesn't
+        carry the stale pre-auto-home pose."""
+        self.external_target_resync_array.get()[0] = 1
 
     # ========= Start/Stop APIs =========
 
@@ -400,8 +470,24 @@ class ViveTeleopProcess(mp.Process):
             # Home mode state
             home_active = False
             home_requested = False
-            home_start_time = 0.0
-            HOME_DURATION = 3.0  # seconds to stay in home mode
+            home_start_time = 0.0   # wall-clock at HOME activation (lerp t=0)
+            # Action duration of the synthesized HOME trajectory. Slightly
+            # longer than the controller's actual move_to_joint_positions time
+            # so that the action lerp comfortably brackets the real motion;
+            # see start_franka_arm.sh + FrankaInterpolationController.home_time.
+            HOME_DURATION = max(self.home_duration, 0.5)
+            # Cartesian endpoints of the synthesized trajectory.
+            # home_lerp_start_pose: the user's last-known intent at the moment
+            #   trackpad is pressed. The lerp begins here so action signal
+            #   is continuous (no jump from previous action sample).
+            # home_lerp_end_pose: the TCP pose corresponding to home_joints,
+            #   read out of self.home_target_pose_array (set by the env after
+            #   startup auto-home). If unset (norm == 0), we fall back to
+            #   obs-following for this one HOME — only impacts the *very
+            #   first* HOME of a session that started before env injected it.
+            home_lerp_start_pose = np.zeros(6, dtype=np.float64)
+            home_lerp_end_pose = np.zeros(6, dtype=np.float64)
+            home_lerp_use_synth = False  # toggled at trackpad-press
 
             # Trackpad rotation state
             rotation_active = False
@@ -479,6 +565,36 @@ class ViveTeleopProcess(mp.Process):
                 trackpad_touched = (abs(trackpad_x) > self.trackpad_touch_threshold or
                                    abs(trackpad_y) > self.trackpad_touch_threshold)
 
+                # === External HOME request synthesis ===
+                # Consumed once-per-rising-edge. Producers:
+                #   * env.move_home()  -- covers cv2 'h' key / SIGHUP
+                #   * FrankaInterpolationController catalog #27 auto-HOME
+                # By spoofing a trackpad rising edge here we reuse the exact
+                # same HOME state-machine + lerp/slerp synthesis that the
+                # user-triggered trackpad-press path uses, so action stream
+                # stays continuous regardless of which path fired the move.
+                if (not home_active) and bool(self.external_home_request_array.get()[0]):
+                    self.external_home_request_array.get()[0] = 0  # consume
+                    trackpad_pressed = True
+                    prev_trackpad = False  # force the rising-edge detector to fire below
+                    if self.verbose:
+                        print("[ViveTeleopProcess] external HOME request received "
+                              "— firing synthetic trackpad press")
+
+                # === Target pose re-sync (env.start_wait → after auto-home) ===
+                # Replaces the stale initial target_pose (captured at Vive
+                # process boot, before auto-home moved the robot) with the
+                # robot's actual current TCP pose. Removes the first-grip
+                # discontinuity between action[0] and obs[0].
+                if bool(self.external_target_resync_array.get()[0]):
+                    self.external_target_resync_array.get()[0] = 0  # consume
+                    curr = get_current_robot_pose()
+                    if curr is not None:
+                        target_pose = curr.copy()
+                        if self.verbose:
+                            print(f"[ViveTeleopProcess] target_pose re-synced to "
+                                  f"current robot pose {curr[:3].round(3).tolist()}")
+
                 # === TRACKPAD: Home pose request ===
                 if trackpad_pressed and not prev_trackpad:
                     # Trackpad just pressed - request home
@@ -497,60 +613,126 @@ class ViveTeleopProcess(mp.Process):
                     # closes again right after opening, and the user sees
                     # the 3-press regression. Catalog #34.
                     gripper_command = GripperCommand.NONE
-                    if self.verbose:
-                        print("[ViveTeleopProcess] HOME requested via trackpad")
+
+                    # === Capture endpoints for the synthesized action trajectory ===
+                    # Start of lerp = whatever the user's last action target was
+                    # (this is target_pose right now: either the last Vive-driven
+                    # value while grip was held, or the held-after-release value).
+                    # End of lerp = home TCP pose (set once by env at startup).
+                    home_lerp_start_pose = target_pose.copy()
+                    end_candidate = self.home_target_pose_array.get().copy()
+                    if np.linalg.norm(end_candidate[:3]) > 1e-6:
+                        home_lerp_end_pose = end_candidate
+                        home_lerp_use_synth = True
+                        if self.verbose:
+                            print(
+                                f"[ViveTeleopProcess] HOME requested — synthesizing "
+                                f"cartesian trajectory from "
+                                f"{home_lerp_start_pose[:3].round(3).tolist()} -> "
+                                f"{home_lerp_end_pose[:3].round(3).tolist()} "
+                                f"over {HOME_DURATION:.1f}s"
+                            )
+                    else:
+                        # First HOME of the session before env has injected
+                        # the home target pose. Fall back to obs-following so
+                        # the action at least matches the robot's actual motion.
+                        home_lerp_use_synth = False
+                        if self.verbose:
+                            print(
+                                "[ViveTeleopProcess] HOME requested — home_target_pose "
+                                "not yet set (first HOME?); using obs-follow fallback"
+                            )
 
                 prev_trackpad = trackpad_pressed
 
-                # === HOME MODE: Output actual robot pose as action ===
+                # === HOME MODE: Synthesize cartesian trajectory as action ===
                 if home_active:
-                    # Always fetch and use actual robot pose during HOME
-                    current_robot_pose = get_current_robot_pose()
-                    if current_robot_pose is not None:
-                        target_pose = current_robot_pose.copy()
+                    elapsed = time.time() - home_start_time
+                    s = min(1.0, max(0.0, elapsed / HOME_DURATION))
+
+                    if home_lerp_use_synth:
+                        # Position: straight-line lerp
+                        target_pose[:3] = (
+                            (1.0 - s) * home_lerp_start_pose[:3]
+                            + s * home_lerp_end_pose[:3]
+                        )
+                        # Rotation: slerp on the unit-quaternion form
+                        try:
+                            r_start = R.from_rotvec(home_lerp_start_pose[3:6])
+                            r_end   = R.from_rotvec(home_lerp_end_pose[3:6])
+                            slerp = Slerp(
+                                [0.0, 1.0],
+                                R.concatenate([r_start, r_end]),
+                            )
+                            r_now = slerp([s])[0]
+                            target_pose[3:6] = r_now.as_rotvec()
+                        except Exception:
+                            # Slerp can fail on near-identical quats (rare);
+                            # fall back to rotvec lerp which is acceptable for
+                            # small angular gaps.
+                            target_pose[3:6] = (
+                                (1.0 - s) * home_lerp_start_pose[3:6]
+                                + s * home_lerp_end_pose[3:6]
+                            )
+                    else:
+                        # First-HOME fallback (no endpoint cached yet): mirror
+                        # the actual robot pose so action ≈ obs for this one
+                        # event. Subsequent HOMEs will use the synthesized
+                        # path because we cache the endpoint at HOME end below.
+                        current_robot_pose = get_current_robot_pose()
+                        if current_robot_pose is not None:
+                            target_pose = current_robot_pose.copy()
 
                     # Check if home mode should end
-                    if (time.time() - home_start_time > HOME_DURATION):
+                    if elapsed > HOME_DURATION:
                         home_active = False
                         home_requested = False
-
-                        # CRITICAL: Force clutch re-sync when HOME ends
-                        # This ensures target_pose starts fresh from current robot pose
                         clutch_active = False
                         prev_target_pos = None
                         prev_target_rot = None
-
-                        # CRITICAL: Require grip release before clutch can be activated
-                        # This ensures FrankaInterpolationController sees proper 0->1 transition
                         require_grip_release = True
-
-                        # Reset rotation state after HOME (robot position changed)
                         base_rotation = None
                         base_position = None
                         accumulated_z_rotation = 0.0
 
                         # Reset GRIPPER toggle state to OPEN to match the
-                        # physical state. env.move_home() opens the gripper as
-                        # part of HOME, but ViveTeleopProcess's gripper_closed
-                        # latch was retaining its pre-HOME value, causing the
-                        # next trigger press to fall on the wrong half of the
-                        # toggle (had to press TWICE to actually close).
+                        # physical state. env.move_home() opens the gripper
+                        # as part of HOME, but ViveTeleopProcess's
+                        # gripper_closed latch was retaining its pre-HOME
+                        # value, causing the next trigger press to fall on
+                        # the wrong half of the toggle. Catalog #34.
                         gripper_closed = False
                         gripper_state = 0.0
                         gripper_command = GripperCommand.NONE
-                        awaiting_trigger_release = True   # ignore stale trigger state
+                        awaiting_trigger_release = True
                         gripper_target_width = self.gripper_open_width
 
-                        # Sync target_pose to current robot pose
-                        if current_robot_pose is not None:
-                            target_pose = current_robot_pose.copy()
+                        # Final action target = the canonical home pose. This
+                        # is what subsequent record_action samples will see
+                        # until the user re-engages grip and starts driving
+                        # the EE elsewhere.
+                        if home_lerp_use_synth:
+                            target_pose = home_lerp_end_pose.copy()
+                        else:
+                            # Fallback path: cache the end-of-HOME pose so
+                            # the *next* HOME event has a synthesizable
+                            # endpoint, then sync action target there.
+                            curr = get_current_robot_pose()
+                            if curr is not None:
+                                target_pose = curr.copy()
+                                self.home_target_pose_array.get()[:] = curr
+                        home_lerp_use_synth = False
 
                         if self.verbose:
-                            print(f"[ViveTeleopProcess] HOME mode ended (synced to: [{target_pose[0]:.3f}, {target_pose[1]:.3f}, {target_pose[2]:.3f}], "
-                                  f"gripper reset to OPEN) - Release grip to continue")
+                            print(
+                                f"[ViveTeleopProcess] HOME ended — action target "
+                                f"now at home pose {target_pose[:3].round(3).tolist()}, "
+                                f"gripper reset to OPEN. Release grip to continue."
+                            )
 
-                    # Skip ALL clutch processing during HOME mode
-                    # (prevents Vive movement from affecting target_pose)
+                    # Skip ALL clutch processing during HOME mode so the user
+                    # waving the Vive around mid-HOME doesn't corrupt the
+                    # synthesized trajectory.
                     prev_grip = grip_pressed
                     prev_trigger = trigger_pressed
 

@@ -50,26 +50,28 @@ def compute_ready_pose(data_format: str, gripper_backend: str) -> np.ndarray:
     """Pick the joint-7 (gripper yaw) value and base 6-joint pose from the
     data format + gripper combination.
 
-    | data_format        | gripper | joints 1..6     | joint 7 |
-    |--------------------|---------|-----------------|---------|
-    | groot (DROID)      | art     | DROID tilt      | 0       |
-    | groot (DROID)      | franka  | DROID tilt      | π/4     |
-    | umi / diffusion    | art     | Franka home     | 0       |  ← yaw matches GR00T
-    | umi / diffusion    | franka  | Franka home     | π/4     |  ← stock Franka pose
+    | data_format    | gripper | joints 1..6  | joint 7 |
+    |----------------|---------|--------------|---------|
+    | groot (DROID)  | art     | DROID tilt   | 0       |
+    | groot (DROID)  | franka  | DROID tilt   | π/4     |
+    | diffusion      | art     | Franka home  | 0       |
+    | diffusion      | franka  | Franka home  | π/4     |
 
-    GR00T uses joint-7=0 with the DROID-tilted base because its training data
-    was collected that way; switching base poses would put state observations
-    out of distribution for the policy.
+    GR00T uses joint-7=0 with the DROID-tilted base because its training
+    data was collected that way; switching base poses would put state
+    observations out of distribution for the policy. The Diffusion-Policy /
+    UMI lineage uses the stock Franka home — same ready-pose either way
+    since both consume our zarr stream identically.
     """
     df = data_format.lower()
     gb = gripper_backend.lower()
     if df == 'groot':
         base = _READY_BASE_DROID
-    elif df in ('umi', 'diffusion'):
+    elif df == 'diffusion':
         base = _READY_BASE_FRANKA
     else:
         raise ValueError(
-            f"Unknown data_format={data_format!r} (use 'groot', 'umi', or 'diffusion')")
+            f"Unknown data_format={data_format!r} (use 'groot' or 'diffusion')")
     j7 = 0.0 if gb == 'art' else np.pi / 4
     return np.array(list(base) + [j7], dtype=np.float64)
 import time
@@ -186,28 +188,20 @@ class FrankaViveEnv:
             verbose=False
             ):
 
-        # Backend-specific defaults
+        # Backend-specific defaults from the central registry.
+        from polymetis_franka_teleop.common.gripper_specs import get_spec
+        spec = get_spec(gripper_backend)
         if tcp_offset is None:
-            # Franka Hand ~10.34cm, ART tip ~21.6cm
-            tcp_offset = 0.216 if gripper_backend == 'art' else 0.1034
-        if gripper_backend == 'art':
-            # ART width envelope is wider than Franka Hand's
-            if gripper_open_width <= 0.075 + 1e-9:
-                gripper_open_width = 0.095
-            # Full mechanical close — ART firmware accepts 0mm. Lets us pinch
-            # thin objects (paper, cards) that won't trigger contact at 5mm.
-            if gripper_close_width is None:
-                gripper_close_width = 0.0
-            # Stronger default grip than Franka Hand — enough to hold smooth
-            # objects without slipping, well below the 100N firmware cap.
-            if grip_force is None:
-                grip_force = 60.0
-        else:  # franka hand
-            # Franka libfranka throws if width=0.0 — leave a 5mm safety margin
-            if gripper_close_width is None:
-                gripper_close_width = 0.005
-            if grip_force is None:
-                grip_force = 30.0
+            tcp_offset = spec.tcp_offset
+        # Width envelope: caller overrides win, otherwise spec applies.
+        # The ``gripper_open_width=0.075`` default is the Franka-Hand value;
+        # treat it as "unset" for the ART path and override to ART's 95 mm.
+        if gripper_backend == 'art' and gripper_open_width <= 0.075 + 1e-9:
+            gripper_open_width = spec.open_width
+        if gripper_close_width is None:
+            gripper_close_width = spec.close_width
+        if grip_force is None:
+            grip_force = spec.default_force
 
         # Resolve ready pose from data_format + gripper_backend if not explicitly given.
         # Resolve latency constants early so sub-controllers (gripper, etc.)
@@ -373,6 +367,9 @@ class FrankaViveEnv:
             tcp_offset=tcp_offset,
             gripper_open_width=gripper_open_width,
             gripper_close_width=gripper_close_width,
+            # Match FrankaInterpolationController.home_time so the synthesized
+            # action lerp closes exactly when the joint-space move finishes.
+            home_duration=2.0,
             verbose=verbose
         )
 
@@ -399,7 +396,10 @@ class FrankaViveEnv:
             verbose=verbose,
             receive_latency=robot_obs_latency,
             teleop_mode=True,
-            teleop_ring_buffer=teleop.robot_ring_buffer
+            teleop_ring_buffer=teleop.robot_ring_buffer,
+            # Share the Vive process's external-HOME flag so the controller's
+            # catalog #27 auto-HOME escalation also fires the action lerp.
+            external_home_request_array=teleop.external_home_request_array,
         )
 
         # === Setup Gripper Controller (teleop mode) ===
@@ -474,11 +474,6 @@ class FrankaViveEnv:
         self.obs_accumulator = None
         self.action_accumulator = None
         self.start_time = None
-
-        # Last robot observation (for non-clutch action recording)
-        # Used when clutch is inactive or during HOME motion
-        self._last_robot_obs_pose = None
-        self._last_gripper_obs_width = None
 
         # Write recording-time config to the zarr meta. The converters
         # (convert_to_gr00t_lerobot, convert_franka_vive_to_umi_format) read
@@ -596,6 +591,29 @@ class FrankaViveEnv:
         import time
         time.sleep(2.0)
 
+        # After auto-home: the robot is now physically at ``ready_pose``.
+        # Sample its TCP pose and feed it to the Vive teleop process so the
+        # synthesized cartesian action trajectory during trackpad-HOME can
+        # lerp/slerp to a known endpoint (instead of falling back to
+        # obs-following). One-shot, runs once per session.
+        try:
+            state = self.robot.get_state()
+            home_tcp = state.get('ActualTCPPose')
+            if home_tcp is not None and np.linalg.norm(home_tcp[:3]) > 1e-6:
+                self.teleop.set_home_target_pose(np.asarray(home_tcp, dtype=np.float64))
+                # Also tell the Vive process to drop its stale pre-auto-home
+                # ``target_pose`` and resample the robot's current pose. This
+                # eliminates the pre-first-grip action ≠ obs discontinuity.
+                self.teleop.sync_target_pose_to_current_robot()
+                if self.verbose:
+                    print(f"[FrankaViveEnv] home_target_pose seeded "
+                          f"{np.asarray(home_tcp)[:3].round(3).tolist()} -> teleop process; "
+                          f"target_pose resync requested")
+        except Exception as e:
+            print(f"[FrankaViveEnv] WARN: could not seed home_target_pose "
+                  f"({type(e).__name__}: {e}); first HOME of this session will "
+                  f"fall back to obs-following.")
+
     def stop_wait(self):
         self.camera.stop_wait()
         self.gripper.stop_wait()
@@ -694,12 +712,6 @@ class FrankaViveEnv:
                 timestamps=last_gripper_data['gripper_timestamp']
             )
 
-        # Store last robot observation for use in record_action when clutch is inactive or HOME
-        # During these states, action = observation for continuous trajectory
-        self._last_robot_obs_pose = robot_pose[-1].copy()  # Latest interpolated pose
-        # gripper_obs['robot0_gripper_width'] shape is (horizon, 1), get the last value as scalar
-        self._last_gripper_obs_width = float(gripper_obs['robot0_gripper_width'][-1, 0])  # Latest gripper width
-
         # Combine all observations
         obs_data = dict(camera_obs)
         obs_data.update(robot_obs)
@@ -709,108 +721,49 @@ class FrankaViveEnv:
         return obs_data
 
     def record_action(self, timestamp=None):
-        """
-        Record action from ViveTeleopProcess.
+        """Record one action sample from the Vive teleop process.
 
-        In teleop mode, actions are computed by ViveTeleopProcess at 100Hz.
-        This method reads the action from the action_ring_buffer and records it.
+        The action stream is intentionally a *synthetic continuous-grip
+        trajectory*: regardless of clutch / HOME / trackpad-rotation state,
+        ``teleop_action['target_pose']`` always carries the user's last
+        expressed intent in TCP coordinates, and ``gripper_target_width``
+        carries the analog trigger value. This method just snapshots both.
 
-        IMPORTANT: For UMI-compatible data collection, the timestamp should be
-        provided by the main loop to maintain a precise time grid:
-            timestamp = t_command_target - time.monotonic() + time.time()
+        State-by-state semantics (handled entirely inside ViveTeleopProcess —
+        env.record_action is a passive reader):
 
-        This ensures actions are recorded at exact intervals (e.g., 0.1s for 10Hz)
-        aligned with the episode start_time.
-
-        Action Source Logic:
-            The action pose source depends on the teleop state:
-
-            1. Clutch ACTIVE (grip button held):
-               - Use Vive teleop target_pose (user is actively controlling)
-
-            2. Clutch INACTIVE (grip button released, not HOME):
-               - Use observation pose (robot holding position via impedance control)
-               - This ensures action = obs for continuous trajectory
-
-            3. HOME motion active:
-               - Use observation pose (robot following its own trajectory to home)
-               - This ensures action = obs during autonomous HOME motion
-
-            This logic ensures:
-            - Before first clutch activation: action = obs (robot stationary)
-            - During teleop: action = vive target (user intent)
-            - During clutch release: action = obs (robot holding position)
-            - During HOME: action = obs (robot autonomous motion)
-            - After HOME, waiting for clutch: action = obs (robot stationary)
+        * **Before first grip-on**: target_pose initialised to the robot's
+          startup pose, so action ≈ obs while the user is idle.
+        * **Grip held**: target_pose = current Vive-driven target.
+        * **Grip released**: target_pose unchanged — the cartesian-impedance
+          controller keeps holding that target with restoring force, and the
+          action stream reflects the user's last intent.
+        * **Trackpad touch (joint-7 rotation)**: target_pose rotates in place
+          around joint-7, even though grip is off.
+        * **Trackpad press (HOME)**: target_pose lerps/slerps from the user's
+          last intent to home_TCP_pose over ``home_duration`` seconds —
+          synthesizing what the action would look like if the user had
+          dragged the gripper to home with grip held.
 
         Args:
-            timestamp: Wall-clock time when this action will be executed.
-                       If None, uses the timestamp from ViveTeleopProcess (not recommended).
+            timestamp: wall-clock time when this action will be executed.
+                       Provided by the main loop for UMI-precise gridding;
+                       falls back to the teleop process's own timestamp.
         """
         if self.action_accumulator is None:
             return
 
-        # Get action from teleop process
         teleop_action = self.teleop.action_ring_buffer.get()
-
-        # Check teleop states
-        clutch_active = bool(teleop_action.get('clutch_active', 0))
-        home_active = bool(teleop_action.get('home_active', 0))
-
-        # Action format: [x, y, z, rx, ry, rz, gripper_width]
-        # - target_pose: Absolute TCP pose (NOT delta!)
-        # - gripper_width: Target gripper width in meters (continuous value)
-        #   - Computed from trigger_value in ViveTeleopProcess
-        #   - Provides smooth transition during trigger press for better Diffusion Policy training
-
-        # Determine target pose based on teleop state
-        if clutch_active and not home_active:
-            # Clutch ACTIVE: Use Vive teleop target_pose (user actively controlling)
-            target_pose = teleop_action['target_pose']  # (6,) absolute pose
-        else:
-            # Clutch INACTIVE or HOME: Use observation pose
-            # This ensures action = obs for:
-            # - Before first clutch activation
-            # - During clutch release (robot holding position)
-            # - During HOME motion (robot following autonomous trajectory)
-            # - After HOME, waiting for clutch re-activation
-            if hasattr(self, '_last_robot_obs_pose') and self._last_robot_obs_pose is not None:
-                target_pose = self._last_robot_obs_pose.copy()
-            else:
-                # Fallback to teleop action if no observation available yet
-                target_pose = teleop_action['target_pose']
-
-        # Get gripper target width
-        # Gripper action is INDEPENDENT of clutch state:
-        #   - Always use teleop gripper_target_width (trigger_value based)
-        #   - This is different from pose, which depends on clutch
-        #
-        # Rationale:
-        #   - Pose: clutch controls whether user is moving the robot
-        #   - Gripper: trigger controls gripper regardless of robot movement
-        #   - User may want to operate gripper while clutch is released
-        #
-        # ViveTeleopProcess computes gripper_target_width based on trigger analog value:
-        #   - OPEN state + trigger pressed: 0.08 → 0.00 (closing)
-        #   - CLOSE state + trigger pressed: 0.00 → 0.08 (opening)
-        #   - After toggle, holds at target until trigger is released
+        target_pose = teleop_action['target_pose']
         gripper_target_width = teleop_action['gripper_target_width']
 
-        # Use provided timestamp (UMI-style grid) or fallback to teleop timestamp
-        if timestamp is None:
-            # Fallback: use teleop timestamp (may cause timing irregularities)
-            action_timestamp = teleop_action['timestamp']
-        else:
-            # Preferred: use main loop's precise timestamp
-            action_timestamp = timestamp
-
-        # Combine into single action array
+        action_timestamp = (
+            float(teleop_action['timestamp']) if timestamp is None else float(timestamp)
+        )
         action = np.concatenate([target_pose, [gripper_target_width]])
-
-        # Record action
         self.action_accumulator.put(
-            action[None, :],  # (1, 7)
-            np.array([action_timestamp])
+            action[None, :],                         # (1, 7)
+            np.array([action_timestamp]),
         )
 
     def exec_actions(self,
@@ -917,6 +870,18 @@ class FrankaViveEnv:
             wait: If True, block until home motion completes (default: False)
         """
         print("[FrankaViveEnv] Moving to HOME position (gripper open + arm to ready pose)...")
+
+        # 0. Signal the Vive process to enter HOME synthesis state. The
+        # trackpad-press path does this internally inside ViveTeleopProcess;
+        # for the other two entry points -- ``h`` key / SIGHUP via this
+        # method, and the controller-internal catalog #27 escalation via
+        # the same shared flag -- the synthesis won't fire unless we tell
+        # the Vive process explicitly. Without this, action stays pinned
+        # to the user's last grip-on target during the autonomous move.
+        try:
+            self.teleop.request_home_synthesis()
+        except Exception as e:
+            print(f"[FrankaViveEnv] WARN: could not signal home synthesis: {e}")
 
         # 1. Open gripper. The ArtGripperController polls input_queue in both
         # teleop and normal modes, so this works during active teleop too.

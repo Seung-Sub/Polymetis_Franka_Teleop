@@ -122,10 +122,11 @@ def run_preflight_check(expected_cameras: int = 2):
 @click.option('--max_rot_velocity', default=None, type=float, help='rad/s, used when --velocity_clamp')
 # ---- ready pose / data-format ----
 @click.option('--data_format', default='groot',
-              type=click.Choice(['groot', 'umi', 'diffusion']),
+              type=click.Choice(['groot', 'diffusion']),
               help='Output format. Determines the ready pose: groot → DROID tilt '
-                   '(matches GR00T-N1.7-DROID training distribution); umi/diffusion → '
-                   'standard Franka home. joint-7 (gripper yaw) is set by --gripper_backend.')
+                   '(matches GR00T-N1.7-DROID training distribution); diffusion → '
+                   'standard Franka home (used by ACT / Diffusion Policy / UMI). '
+                   'joint-7 (gripper yaw) is set by --gripper_backend.')
 @click.option('--auto_home/--no_auto_home', default=True,
               help='Auto-move to ready pose at startup before the teleop loop begins')
 # ---- gripper grip strength ----
