@@ -529,17 +529,40 @@ class FrankaViveEnv:
         # attrs). Layout matches data_pipeline_spec.md §4.
         try:
             import json
+            # ART / Franka Hand mechanical widths for the gripper convention
+            # block below. ART firmware accepts a full 0 mm close; Franka
+            # Hand's libfranka rejects width=0 so we use a 5 mm floor.
+            _max_width_m = {
+                'art_gripper': 0.095,
+                'franka_hand': 0.075,
+            }
             ds_meta = {
                 'dataset_name': self.output_dir.name,
                 'version': '2.0.0',
+                'schema_version': '2.0.0',
                 'robot_type': 'franka_panda',
                 'gripper_type': self.gripper_backend,
                 'frame_conventions': {
                     'ee_pose_frame': 'base',
+                    'ee_velocity_frame': 'flange',
+                    'ee_velocity_note': (
+                        'Computed as J(q) @ qd in pinocchio frame '
+                        'conventions. NOT TCP -- cross-product term to TCP '
+                        'neglected (|omega| x |tx_flange_tip| <= ~22 cm/s '
+                        'at teleop speeds).'
+                    ),
                     'quaternion_order': '[qx, qy, qz, qw]',
                     'quaternion_sign_normalized': True,
-                    'gripper_convention_discrete': '0=open, 1=closed',
-                    'gripper_convention_continuous': 'width in meters [close_width, open_width]',
+                },
+                'gripper_convention': {
+                    'signal': 'gripper_position (zarr key: robot0_gripper_width)',
+                    'unit': 'meters',
+                    'direction': '0 = mechanically closed, max_width = fully open',
+                    'max_width_m': _max_width_m,
+                    'normalization_for_droid': (
+                        'normalized = width / max_width '
+                        '(0=closed, 1=open, matches DROID/spec direction)'
+                    ),
                 },
                 'control_loop_rate_hz': 100,
                 'state_sample_rate_hz': 100,
@@ -549,6 +572,44 @@ class FrankaViveEnv:
                 'storage_container': 'zarr',
                 'obs_native_layout': 'contiguous + episode_ranges (mirrors data/ + episode_ends)',
                 'calibration_method': 'none yet (extrinsics placeholder; future apriltag)',
+                # F4 (c): joint_torque_external source disclosure -- the
+                # protobuf field is officially undocumented but maps to
+                # libfranka's tau_ext_hat_filtered, the canonical estimated
+                # external torque. May break across polymetis releases.
+                'joint_torque_external_source': (
+                    'polymetis.proto motor_torques_external (field 8); '
+                    'maps to libfranka tau_ext_hat_filtered '
+                    '(community/private API, may change in future polymetis '
+                    'versions)'
+                ),
+                # F5: how the action.*_velocity_cmd fields are derived. The
+                # controller runs the finite-diff inline at 100 Hz (see
+                # franka_interpolation_controller.run() state-write block).
+                'action_velocity_cmd_method': 'finite_difference',
+                'action_velocity_cmd_dt_s': 1.0 / 100.0,
+                'action_angular_velocity_cmd_space': (
+                    'axis_angle (rotvec) direct difference; SLERP / '
+                    'quaternion derivative NOT used. Accurate for per-step '
+                    'rotation < 0.5 rad; may show wraparound spikes near '
+                    'pi. Policy mode with sparse action chunks may have '
+                    'additional inaccuracy -- spline derivative deferred '
+                    'to Batch 3.'
+                ),
+                # F6: planned health-check items so future tooling (and
+                # this commit's reviewers) know what to look for. Each
+                # entry is a free-form description; the actual check
+                # implementations land in check_dataset_health.py.
+                'validation_checks_planned': [
+                    'monotonic timestamp grid (dt == 1/frequency +/- tolerance)',
+                    'NaN-free across all zarr arrays',
+                    'episode_count == len(episode_tasks) == len(episode_ids) == ... (6 lists)',
+                    'language.json existence and instruction == episode_tasks[i] per episode',
+                    'cam_<i>_frame_timestamps.npy length == ffprobe frame count for matching mp4',
+                    'action_ee_angular_velocity_cmd norm > 10 rad/s frequency < 0.1% per episode '
+                    '(axis-angle wraparound spike detector; 100 Hz x 0.1 rad = 10 rad/s normal upper)',
+                    'obs_native_episode_ranges aligns with episode_ends (no orphan rows)',
+                    'quaternion sign continuity: max consecutive dot product is >= 0',
+                ],
             }
             (self.output_dir / 'dataset_meta.json').write_text(json.dumps(ds_meta, indent=2))
         except Exception as e:
@@ -1088,6 +1149,15 @@ class FrankaViveEnv:
             dt=1/self.frequency
         )
 
+        # Post-condition: we just appended one entry to each of the 6 meta
+        # lists, so we should be in the "pending" state (attrs ahead of
+        # n_episodes by exactly 1). Catches future regressions where
+        # someone adds a 7th list and forgets to mirror it elsewhere.
+        try:
+            self._assert_episode_meta_consistency(pending=True)
+        except AssertionError as e:
+            print(f'[FrankaViveEnv] WARN: start_episode post-state inconsistent: {e}')
+
         print(f'Episode {episode_id} started!')
 
     def end_episode(self):
@@ -1236,32 +1306,165 @@ class FrankaViveEnv:
                 # (matches start_episode's atomic-write pattern).
                 self._finalise_language_json(episode_id, success=True)
 
+                # Post-condition: replay_buffer.add_episode bumped
+                # n_episodes by 1, returning us to the steady state where
+                # attrs lists match n_episodes exactly.
+                try:
+                    self._assert_episode_meta_consistency(pending=False)
+                except AssertionError as e:
+                    print(f'[FrankaViveEnv] WARN: end_episode post-state inconsistent: {e}')
+
             self.obs_accumulator = None
             self.action_accumulator = None
 
+    # === Episode metadata consistency ===
+    # Invariants maintained across (start | end | drop)_episode:
+    #   * Steady state (between episodes):
+    #         len(episode_tasks) == len(episode_ids) == ... == n_episodes
+    #   * Pending state (after start_episode, before end/drop_episode):
+    #         len(episode_tasks) == ... == n_episodes + 1
+    #
+    # All 6 lists are append/pop'd together so they share a single length.
+    # We assert at every transition so a future bug (added a 7th list,
+    # forgot to mirror append in pop, etc.) trips loudly instead of
+    # silently producing a drifted dataset that the health-checker has to
+    # detect post-hoc.
+    _EPISODE_META_LISTS = (
+        'episode_tasks',
+        'episode_ids',
+        'episode_task_ids',
+        'episode_scene_ids',
+        'episode_software_versions',
+        'episode_start_iso',
+    )
+
+    def _assert_episode_meta_consistency(self, pending: bool) -> None:
+        """Assert the 6 per-episode meta lists agree with n_episodes.
+
+        Args:
+            pending: True when we expect attrs to be one ahead of
+                ``replay_buffer.n_episodes`` (= inside an open episode).
+                False for the between-episodes steady state.
+        """
+        try:
+            import zarr
+            root = zarr.open(str(self.output_dir.joinpath('replay_buffer.zarr').absolute()), 'a')
+            meta = root.require_group('meta')
+            n_eps = int(self.replay_buffer.n_episodes)
+            expected = n_eps + (1 if pending else 0)
+            mismatches = []
+            for k in self._EPISODE_META_LISTS:
+                actual = len(list(meta.attrs.get(k, [])))
+                if actual != expected:
+                    mismatches.append(f'{k}={actual}')
+            if mismatches:
+                state = 'pending' if pending else 'steady'
+                raise AssertionError(
+                    f'episode meta inconsistency ({state} state, expected '
+                    f'len={expected}): {", ".join(mismatches)}'
+                )
+        except AssertionError:
+            raise
+        except Exception as e:
+            # Soft failure if zarr can't be opened at this moment — log
+            # rather than crash, since this helper is advisory.
+            print(f'[FrankaViveEnv] WARN: meta consistency check error: {e}')
+
     def drop_episode(self):
-        """Drop current episode without saving."""
-        self.end_episode()
-        self.replay_buffer.drop_episode()
-        episode_id = self.replay_buffer.n_episodes
+        """Drop current episode without saving.
+
+        Atomicity goal: leave the dataset in a self-consistent state
+        whether or not individual rollback steps succeed. We do NOT
+        provide a true transactional guarantee (zarr has no rollback),
+        but we sequence steps from most → least recoverable and log
+        each one's outcome so a human operator can reconstruct what
+        landed.
+        """
+        # Pre-condition: we should be in pending state (start_episode
+        # was called and appended to attrs).
+        try:
+            self._assert_episode_meta_consistency(pending=True)
+        except AssertionError as e:
+            print(f'[FrankaViveEnv] WARN: drop_episode pre-state inconsistent: {e}')
+
+        steps_completed = []
+        steps_failed = []
+
+        # Step 1: finalise accumulators and write the (about-to-be-dropped)
+        # episode to zarr — required because the rest of the rollback
+        # assumes the episode exists in the data/ group.
+        try:
+            self.end_episode()
+            steps_completed.append('end_episode')
+        except Exception as e:
+            steps_failed.append(('end_episode', str(e)))
+
+        # Step 2: pop the data/ group's last episode (UMI replay_buffer).
+        try:
+            self.replay_buffer.drop_episode()
+            steps_completed.append('replay_buffer.drop_episode')
+        except Exception as e:
+            steps_failed.append(('replay_buffer.drop_episode', str(e)))
+
+        episode_id = int(self.replay_buffer.n_episodes)  # after drop, this is the dropped id
+
+        # Step 3: pop the 6 meta.attrs episode lists. **This was the
+        # missing rollback** that caused length drift on every drop.
+        try:
+            import zarr
+            root = zarr.open(str(self.output_dir.joinpath('replay_buffer.zarr').absolute()), 'a')
+            meta = root.require_group('meta')
+            for k in self._EPISODE_META_LISTS:
+                lst = list(meta.attrs.get(k, []))
+                if lst:
+                    lst.pop()  # drop the just-appended entry
+                    meta.attrs[k] = lst
+            steps_completed.append('meta.attrs.pop x6')
+        except Exception as e:
+            steps_failed.append(('meta.attrs.pop', str(e)))
+
+        # Step 4: rmtree videos/<ep>/. Sweeps language.json, calibration/,
+        # cam_<idx>_frame_timestamps.npy in one shot.
         this_video_dir = self.video_dir.joinpath(str(episode_id))
         if this_video_dir.exists():
-            shutil.rmtree(str(this_video_dir))
-        # Also roll back the matching native-rate range row, if present.
+            try:
+                shutil.rmtree(str(this_video_dir))
+                steps_completed.append(f'rmtree videos/{episode_id}')
+            except Exception as e:
+                steps_failed.append((f'rmtree videos/{episode_id}', str(e)))
+
+        # Step 5: truncate obs_native/* + meta/obs_native_episode_ranges.
         try:
             import zarr
             root = zarr.open(str(self.output_dir.joinpath('replay_buffer.zarr').absolute()), 'a')
             if 'obs_native_episode_ranges' in root.get('meta', {}):
                 rng = root['meta']['obs_native_episode_ranges']
                 if rng.shape[0] > episode_id:
-                    # Truncate every obs_native key back to the row's start.
                     start = int(rng[episode_id, 0])
                     if 'obs_native' in root:
                         for k in list(root['obs_native'].array_keys()):
                             root['obs_native'][k].resize(start, *root['obs_native'][k].shape[1:])
                     rng.resize(episode_id, 2)
+                    steps_completed.append('obs_native truncate')
         except Exception as e:
-            print(f'[FrankaViveEnv] WARN: drop_episode native-rate rollback failed: {e}')
+            steps_failed.append(('obs_native truncate', str(e)))
+
+        # Report
+        if steps_failed:
+            import sys
+            print(f'[FrankaViveEnv] drop_episode partial: '
+                  f'completed={steps_completed}  failed={steps_failed}',
+                  file=sys.stderr, flush=True)
+            print(f'[FrankaViveEnv] dataset may be inconsistent — run '
+                  f'tools/check_dataset_health.py before next session',
+                  file=sys.stderr, flush=True)
+
+        # Post-condition assertion: should be in steady state.
+        try:
+            self._assert_episode_meta_consistency(pending=False)
+        except AssertionError as e:
+            print(f'[FrankaViveEnv] WARN: drop_episode post-state inconsistent: {e}')
+
         print(f'Episode {episode_id} dropped!')
 
     def _finalise_language_json(self, episode_id: int, success: bool) -> None:

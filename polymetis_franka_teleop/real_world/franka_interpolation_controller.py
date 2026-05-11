@@ -204,26 +204,34 @@ class FrankaInterface:
     def get_robot_state_batched(self):
         """Single-RPC state snapshot + local FK + Jacobian.
 
-        Returns a dict with all the proprioception fields the data pipeline
+        Returns a dict with the proprioception fields the data pipeline
         needs:
             joint_position        (7,)   rad
             joint_velocity        (7,)   rad/s
-            joint_torque_external (7,)   Nm   (libfranka motor_torques_external)
+            joint_torque_external (7,)   Nm   (libfranka motor_torques_external,
+                                              i.e. tau_ext_hat_filtered; the
+                                              measured external load, NOT the
+                                              controller's PD output)
             ee_pose               (6,)   TCP frame [x,y,z, rx,ry,rz] axis-angle
             ee_position           (3,)   TCP frame, m
             ee_orientation_quat   (4,)   TCP frame, [qx,qy,qz,qw]
-            ee_linear_velocity    (3,)   TCP frame, m/s
-            ee_angular_velocity   (3,)   TCP frame, rad/s
+            ee_linear_velocity    (3,)   FLANGE frame, m/s
+            ee_angular_velocity   (3,)   FLANGE frame, rad/s
 
-        Wire-level cost: **1** ``get_robot_state()`` gRPC. FK + Jacobian are
-        local pinocchio calls (no RPC). Net: 3 → 1 RPC per controller iter
-        compared to the old per-key approach, eliminating ~200 RPC/s under
-        the 100 Hz teleop loop.
+        Frame note: the *pose* is in the TCP (tip) frame because
+        ``tx_flange_tip`` is applied below. The *velocity* is the spatial
+        velocity ``J(q) @ q_dot`` from the pinocchio frame Jacobian; we
+        deliberately do NOT transport it into the TCP frame because the
+        TCP offset is a pure translation along flange Z and the resulting
+        cross-product term ``omega x (R @ tx_flange_tip[:3,3])`` is small
+        at teleop speeds (|omega| < 1 rad/s, |tx_flange_tip| <= 0.22 m =>
+        max ~22 cm/s error). Converters that need TCP-frame velocity can
+        re-derive from ``joint_velocity`` directly.
 
-        Velocity is the *measured* spatial velocity: J(q) @ q_dot, expressed
-        in the flange frame (polymetis convention), then transformed through
-        ``self.tx_flange_tip`` like the pose. Caller is responsible for
-        further frame conversions if needed.
+        Wire-level cost: **1** ``get_robot_state()`` gRPC. FK + Jacobian
+        are local pinocchio calls (no RPC). Net: 3 → 1 RPC per controller
+        iter compared to the old per-key approach, eliminating ~200 RPC/s
+        under the 100 Hz teleop loop.
         """
         import torch
         rs = self.robot.get_robot_state()

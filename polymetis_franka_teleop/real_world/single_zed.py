@@ -292,6 +292,11 @@ class SingleZed(mp.Process):
             put_start_time = self.put_start_time or time.time()
             iter_idx = 0
             t_loop = time.time()
+            # F2: per-recording frame-timestamp accumulator + sidecar npy
+            # path (populated on START_RECORDING, dumped + cleared on
+            # STOP_RECORDING). ``None`` = not currently recording.
+            recording_frame_times = None
+            recording_sidecar_path = None
             mat = sl.Mat()
             rt = sl.RuntimeParameters()
             # 1-second moving-window FPS counter — instantaneous 1/Δt prints
@@ -354,6 +359,15 @@ class SingleZed(mp.Process):
                     else (data if self.recording_transform is None else self.recording_transform(dict(data)))
                 if self.video_recorder.is_ready():
                     self.video_recorder.write_frame(rec_data['color'], frame_time=calibrated_time)
+                    # F2: also accumulate the per-frame calibrated timestamp
+                    # for sidecar dump on STOP_RECORDING. ``calibrated_time``
+                    # is the latency-compensated capture time on the same
+                    # monotonic clock as robot/gripper timestamps in
+                    # obs_native, so downstream tooling can align mp4 frames
+                    # against robot data without relying on mp4 PTS (which
+                    # is encoder-generated and may not match capture).
+                    if recording_frame_times is not None:
+                        recording_frame_times.append(calibrated_time)
 
                 # Commands
                 try:
@@ -390,9 +404,42 @@ class SingleZed(mp.Process):
                         print(f'[SingleZed {self.serial_number}] START_RECORDING path={path!r} (raw type={type(raw).__name__}) start_time={st}', flush=True)
                         self.video_recorder.start_recording(path, start_time=None if st < 0 else st)
                         print(f'[SingleZed {self.serial_number}] video_recorder.is_ready()={self.video_recorder.is_ready()}', flush=True)
+                        # F2: open the frame-timestamp accumulator + decide
+                        # sidecar destination: ``<video_dir>/cam_<idx>_frame_timestamps.npy``
+                        # where ``<idx>`` is the trailing integer in the mp4
+                        # name (videos/<ep>/0.mp4 → cam_0_…). Keeping the
+                        # sidecar inside the same episode dir means
+                        # drop_episode's rmtree wipes it automatically.
+                        recording_frame_times = []
+                        import os as _os
+                        mp4_dir = _os.path.dirname(path)
+                        mp4_base = _os.path.splitext(_os.path.basename(path))[0]
+                        recording_sidecar_path = _os.path.join(
+                            mp4_dir, f'cam_{mp4_base}_frame_timestamps.npy'
+                        )
                     elif cmd == Command.STOP_RECORDING.value:
                         self.video_recorder.stop_recording()
                         put_idx = None
+                        # F2: flush the accumulated frame timestamps next to
+                        # the mp4, then reset state for the next episode.
+                        if (recording_frame_times is not None
+                                and recording_sidecar_path is not None
+                                and len(recording_frame_times) > 0):
+                            try:
+                                np.save(recording_sidecar_path,
+                                        np.asarray(recording_frame_times,
+                                                   dtype=np.float64))
+                                if self.verbose:
+                                    print(f'[SingleZed {self.serial_number}] '
+                                          f'frame timestamps -> {recording_sidecar_path} '
+                                          f'(n={len(recording_frame_times)})',
+                                          flush=True)
+                            except Exception as e:
+                                print(f'[SingleZed {self.serial_number}] '
+                                      f'WARN: could not write frame_timestamps '
+                                      f'sidecar: {e}', flush=True)
+                        recording_frame_times = None
+                        recording_sidecar_path = None
                     elif cmd == Command.RESTART_PUT.value:
                         put_idx = None
                         put_start_time = float(commands['put_start_time'][i])
