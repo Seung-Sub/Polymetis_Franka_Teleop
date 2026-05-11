@@ -57,14 +57,21 @@ from polymetis_franka_teleop.common.rotation_util import quat_to_rot6d
 STATE_DIM = ACTION_DIM = 17
 
 # Video keys we write into ``modality.json``.  GR00T's pretrained
-# ``oxe_droid_relative_eef_relative_joint`` embodiment expects
-# ``exterior_image_1_left`` + ``wrist_image_left`` (see
-# ``gr00t.configs.data.embodiment_configs.MODALITY_CONFIGS``); the dataset
-# loader auto-maps by position when the modality.json keys differ
-# (``lerobot_episode_loader.py:276-295``), so a dual-exterior naming is
-# safe: cam0 -> exterior_image_1_left (model slot), cam1 -> wrist_image_left.
-LOGICAL_VIDEO_KEYS = ("exterior_1_left", "exterior_2_left")
+# ``oxe_droid_relative_eef_relative_joint`` embodiment expects exactly
+# these two keys (see ``gr00t.configs.data.embodiment_configs.MODALITY_CONFIGS``).
+# Matching the names here makes ``LeRobotEpisodeLoader`` use name-based
+# mapping and skip the positional fallback warning at
+# ``lerobot_episode_loader.py:276-295``.
+LOGICAL_VIDEO_KEYS = ("exterior_image_1_left", "wrist_image_left")
 ORIGINAL_VIDEO_KEYS = tuple(f"observation.images.{k}" for k in LOGICAL_VIDEO_KEYS)
+
+# Physical cam -> video-key assignment is determined per-session from the
+# stereo baseline in each ``cam_<i>.json`` (ZED Mini ~63 mm = wrist; ZED 2i
+# ~120 mm = third / exterior).  See ``_classify_cams`` for the threshold.
+# Using a measured intrinsic instead of a hardcoded ``cam_0 = wrist`` keeps
+# the converter correct if the operator reorders ``--camera_serials`` at
+# the demo wrapper level.
+WRIST_BASELINE_MAX_M = 0.08  # ZED Mini ~0.063 m; ZED 2i ~0.120 m
 
 # Placeholder task description for sandbox sessions whose language.json
 # carries ``instruction: null``.  Enabled only with --allow-placeholder.
@@ -212,15 +219,67 @@ def write_parquet(
     pq.write_table(table, out_path)
 
 
-def symlink_videos(session_dir: Path, output_dir: Path, episode_index: int) -> None:
-    """Symlink each cam mp4 from the session into the LeRobot video tree.
+def _classify_cams(session_dir: Path, episode_index: int) -> dict[int, str]:
+    """Map each ``cam_<i>.json`` to its DROID video key by stereo baseline.
+
+    ZED Mini (~63 mm baseline) -> wrist; ZED 2i (~120 mm) -> third / exterior.
+    Threshold ``WRIST_BASELINE_MAX_M`` separates the two; raises if the
+    classification is ambiguous (e.g. two ZED 2i, or two ZED Mini, or any
+    baseline inside the threshold band).
+    """
+    calib_dir = session_dir / "videos" / str(episode_index) / "calibration"
+    cam_files = sorted(calib_dir.glob("cam_*.json"))
+    if len(cam_files) != 2:
+        raise RuntimeError(
+            f"expected 2 cam_<i>.json in {calib_dir}, found {len(cam_files)}: "
+            f"{[p.name for p in cam_files]}"
+        )
+    baselines: dict[int, float] = {}
+    for p in cam_files:
+        with open(p) as fp:
+            calib = json.load(fp)
+        cam_idx = int(p.stem.split("_")[1])
+        baselines[cam_idx] = float(calib["intrinsics"]["baseline_m"])
+
+    wrist_idx    = min(baselines, key=baselines.get)
+    exterior_idx = max(baselines, key=baselines.get)
+    if baselines[wrist_idx] >= WRIST_BASELINE_MAX_M:
+        raise RuntimeError(
+            f"Cannot classify wrist vs exterior cam: both baselines "
+            f">= {WRIST_BASELINE_MAX_M} m ({baselines}). Looks like two "
+            f"ZED 2i (or two of the same model). Add an explicit "
+            f"--wrist-cam-index CLI flag or fix the camera setup."
+        )
+    if baselines[exterior_idx] < WRIST_BASELINE_MAX_M:
+        raise RuntimeError(
+            f"Cannot classify wrist vs exterior cam: both baselines "
+            f"< {WRIST_BASELINE_MAX_M} m ({baselines}). Looks like two "
+            f"ZED Mini. Same fix as above."
+        )
+
+    return {
+        wrist_idx:    "observation.images.wrist_image_left",
+        exterior_idx: "observation.images.exterior_image_1_left",
+    }
+
+
+def symlink_videos(
+    session_dir: Path,
+    output_dir: Path,
+    episode_index: int,
+    cam_video_map: dict[int, str],
+) -> None:
+    """Symlink each cam mp4 into the LeRobot video tree under its DROID key.
 
     Symlinks rather than copies: zero space cost, fast, and the rmtree
     semantics of ``drop_episode`` are preserved (rmtree on the session's
     per-episode dir invalidates these symlinks as expected).
+
+    ``cam_video_map`` is the per-session result of ``_classify_cams``:
+    ``{cam_idx -> "observation.images.<wrist|exterior_image_1>_left"}``.
     """
     chunk_id = episode_index // 1000
-    for cam_idx, original_key in enumerate(ORIGINAL_VIDEO_KEYS):
+    for cam_idx, original_key in cam_video_map.items():
         src = (session_dir / "videos" / str(episode_index) / f"{cam_idx}.mp4").resolve()
         if not src.exists():
             raise FileNotFoundError(f"missing mp4 for ep={episode_index} cam={cam_idx}: {src}")
@@ -244,22 +303,40 @@ def _video_shape(session_dir: Path, episode_index: int, cam_idx: int) -> tuple[i
     return int(intr["height"]), int(intr["width"])
 
 
+def _video_shape_by_key(
+    session_dir: Path,
+    episode_index: int,
+    cam_video_map: dict[int, str],
+    original_key: str,
+) -> tuple[int, int]:
+    """Lookup (H, W) for a given video-key by reversing the cam_video_map."""
+    for cam_idx, k in cam_video_map.items():
+        if k == original_key:
+            return _video_shape(session_dir, episode_index, cam_idx)
+    raise KeyError(f"{original_key} not in cam_video_map={cam_video_map}")
+
+
 def write_meta(
     output_dir: Path,
     session: dict,
     fps: int,
     episode_summaries: list[dict],
     task_list: list[str],
+    cam_video_map: dict[int, str],
 ) -> None:
     meta_dir = output_dir / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use episode 0 cam 0 / 1 intrinsics for video shape (same camera setup
-    # across all episodes within a session). The features block expects
-    # (H, W, 3) — RGB. Both cams use identical intrinsics in ZED VGA pairs
-    # so we read each independently and emit per-key shape.
-    h0, w0 = _video_shape(session["session_dir"], 0, 0)
-    h1, w1 = _video_shape(session["session_dir"], 0, 1)
+    # Per-video-key shape lookup via cam_video_map.  ZED Mini and ZED 2i can
+    # use different image sizes; in VGA mode they're both 672x376 today, but
+    # this stays correct if the operator changes camera_resolution.  Lookup
+    # by original_key, not cam_idx, so the order in info.json["features"]
+    # tracks the canonical modality.json ordering (exterior first, wrist
+    # second).
+    h_ext, w_ext = _video_shape_by_key(
+        session["session_dir"], 0, cam_video_map, ORIGINAL_VIDEO_KEYS[0])
+    h_wri, w_wri = _video_shape_by_key(
+        session["session_dir"], 0, cam_video_map, ORIGINAL_VIDEO_KEYS[1])
 
     n_eps = len(episode_summaries)
     total_frames = sum(s["length"] for s in episode_summaries)
@@ -275,8 +352,8 @@ def write_meta(
         "chunks_size": 1000,
         "splits": {"train": f"0:{n_eps}"},
         "features": {
-            ORIGINAL_VIDEO_KEYS[0]: {"dtype": "video", "shape": [h0, w0, 3]},
-            ORIGINAL_VIDEO_KEYS[1]: {"dtype": "video", "shape": [h1, w1, 3]},
+            ORIGINAL_VIDEO_KEYS[0]: {"dtype": "video", "shape": [h_ext, w_ext, 3]},
+            ORIGINAL_VIDEO_KEYS[1]: {"dtype": "video", "shape": [h_wri, w_wri, 3]},
             "observation.state":   {"dtype": "float32", "shape": [STATE_DIM]},
             "action":              {"dtype": "float32", "shape": [ACTION_DIM]},
             "task_index":          {"dtype": "int64",   "shape": [1]},
@@ -383,6 +460,13 @@ def main() -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Per-session cam classification: which cam_<i> is wrist (ZED Mini) and
+    # which is exterior (ZED 2i).  Done once from episode-0 intrinsics --
+    # the physical setup is constant across a session.
+    cam_video_map = _classify_cams(session_dir, episode_index=0)
+    if args.verbose:
+        print(f"  cam_video_map = {cam_video_map}", flush=True)
+
     episode_summaries: list[dict] = []
     global_index = 0
     for ep in range(n_eps):
@@ -398,7 +482,7 @@ def main() -> int:
         parquet_path = output_dir / "data" / f"chunk-{chunk_id:03d}" / f"episode_{ep:06d}.parquet"
         task_idx = task_index_map[instructions[ep]]
         write_parquet(state, action, fps, ep, task_idx, global_index, parquet_path)
-        symlink_videos(session_dir, output_dir, ep)
+        symlink_videos(session_dir, output_dir, ep, cam_video_map)
 
         episode_summaries.append({
             "episode_index": ep,
@@ -410,7 +494,7 @@ def main() -> int:
             print(f"  ep {ep}: len={ep_len}  task_index={task_idx}  task='{instructions[ep]}'",
                   flush=True)
 
-    write_meta(output_dir, session, fps, episode_summaries, task_list)
+    write_meta(output_dir, session, fps, episode_summaries, task_list, cam_video_map)
 
     # ---- stats.json ----
     # Try the official GR00T tool first; it also emits ``meta/relative_stats.json``
