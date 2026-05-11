@@ -78,6 +78,12 @@ def main():
     # reaching for the controller) used to silently kill ongoing recording
     # sessions. Now we require two q presses within 1.5 s.
     last_q_t = 0.0
+    # Drop confirmation state — Backspace arms a 5 s window during which a
+    # single 'y' confirms the drop (relayed to the demo via SIGRTMIN); 'n'
+    # cancels. Bundling the 2-step confirmation here means only one signal
+    # (SIGRTMIN) crosses the process boundary instead of needing bespoke
+    # signals for Backspace / y / n individually.
+    drop_armed_t = 0.0
     while True:
         new_img, new_mtime = _read_jpeg_with_retry(args.path, last_mtime)
         if new_img is not None:
@@ -87,6 +93,11 @@ def main():
         # waitKey returns the keycode (-1 if none). 1 ms event-pump is enough
         # to keep the window alive.
         key = cv2.waitKey(1) & 0xFF
+        # Auto-expire the drop confirmation window after 5 s of no y/n.
+        if drop_armed_t > 0.0 and (time.monotonic() - drop_armed_t) > 5.0:
+            print('[cv2_viewer] drop confirmation timed out (no y within 5 s)',
+                  flush=True)
+            drop_armed_t = 0.0
         if args.signal_pid > 0 and key != 0xFF:  # 0xFF (=255) means no key
             try:
                 if key == ord('q'):
@@ -109,6 +120,20 @@ def main():
                 elif key == ord('h'):
                     print('[cv2_viewer] h pressed -> SIGHUP (home)', flush=True)
                     os.kill(args.signal_pid, signal.SIGHUP)
+                elif key in (8, 127):  # Backspace (8) or Delete (127)
+                    drop_armed_t = time.monotonic()
+                    print('[cv2_viewer] Backspace -- press y within 5 s to '
+                          'confirm drop, n to cancel', flush=True)
+                elif key == ord('y'):
+                    if drop_armed_t > 0.0:
+                        print('[cv2_viewer] y pressed -> SIGRTMIN (drop episode)',
+                              flush=True)
+                        os.kill(args.signal_pid, signal.SIGRTMIN)
+                        drop_armed_t = 0.0
+                elif key == ord('n'):
+                    if drop_armed_t > 0.0:
+                        print('[cv2_viewer] n pressed -- drop cancelled', flush=True)
+                        drop_armed_t = 0.0
             except ProcessLookupError:
                 # demo is gone — exit viewer too
                 break

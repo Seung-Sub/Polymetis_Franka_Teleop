@@ -388,10 +388,15 @@ def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
             #   SIGUSR1        -> 'c' (start recording episode)
             #   SIGUSR2        -> 's' (stop recording episode + save)
             #   SIGHUP         -> 'h' (move to home pose)
+            #   SIGRTMIN       -> drop_episode confirmed (viewer holds the
+            #                    Backspace+y 2-step locally; we get a single
+            #                    "drop now" pulse only after the user
+            #                    confirms with y within the 5 s window)
             import signal as _sig
             # Flags read in the main loop body; set from signal handlers.
             sig_record_request = [None]   # 'start' | 'stop' | None
             sig_home_request = [False]
+            sig_drop_request = [False]
             def _on_quit_signal(sig, frame):
                 nonlocal stop  # noqa: F824
                 stop = True
@@ -403,12 +408,15 @@ def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
                 sig_record_request[0] = 'stop'
             def _on_home(sig, frame):
                 sig_home_request[0] = True
+            def _on_drop(sig, frame):
+                sig_drop_request[0] = True
             try:
                 _sig.signal(_sig.SIGINT,  _on_quit_signal)
                 _sig.signal(_sig.SIGTERM, _on_quit_signal)
                 _sig.signal(_sig.SIGUSR1, _on_record_start)
                 _sig.signal(_sig.SIGUSR2, _on_record_stop)
                 _sig.signal(_sig.SIGHUP,  _on_home)
+                _sig.signal(_sig.SIGRTMIN, _on_drop)
             except ValueError:
                 pass
 
@@ -494,6 +502,18 @@ def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
                         print('[HOME] Moving to home position via keyboard signal...')
                         env.move_home(wait=False)
                         home_command_sent = True
+
+                # SIGRTMIN-relayed drop_episode (viewer already confirmed
+                # Backspace+y locally; we trust the pulse).
+                if sig_drop_request[0]:
+                    sig_drop_request[0] = False
+                    if is_recording:
+                        env.drop_episode()
+                        is_recording = False
+                        pending_drop = False
+                        print('[DROP] Episode dropped via viewer!')
+                    else:
+                        print('[drop] not recording, ignored')
 
                 # Check pending drop timeout (5 seconds)
                 if pending_drop and (time.monotonic() - pending_drop_time) > 5.0:
