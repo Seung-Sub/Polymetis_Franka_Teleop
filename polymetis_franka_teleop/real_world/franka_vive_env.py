@@ -507,9 +507,52 @@ class FrankaViveEnv:
             }
             for k, v in cfg.items():
                 meta.attrs[k] = v
+
+            # === Schema v2 conventions (data_pipeline_spec.md §4) ===
+            # These never change within a dataset; persisted so converters
+            # and downstream tooling can rely on them without re-deriving.
+            meta.attrs['schema_version']           = '2.0.0'
+            meta.attrs['quaternion_order']         = '[qx, qy, qz, qw]'
+            meta.attrs['quaternion_sign_normalised'] = True
+            meta.attrs['ee_pose_frame']            = 'base'
+            meta.attrs['gripper_convention']       = '0=open, 1=closed (binary toggle); width in meters (continuous)'
+            meta.attrs['robot_type']               = 'franka_panda'
+            meta.attrs['teleop_device']            = 'vive_pro_controller'
+            meta.attrs['obs_native_layout']        = 'contiguous + episode_ranges'
+            meta.attrs['obs_native_ranges_shape']  = '(E, 2, 2) — [[r_start, r_end], [g_start, g_end]] per episode'
         except Exception as e:
             # never block recording on a meta-write failure
             print(f"[FrankaViveEnv] WARN: could not write zarr meta config: {e}")
+
+        # Also write a dataset_meta.json side-car at the session dir level
+        # (more discoverable for casual inspection than poking into zarr
+        # attrs). Layout matches data_pipeline_spec.md §4.
+        try:
+            import json
+            ds_meta = {
+                'dataset_name': self.output_dir.name,
+                'version': '2.0.0',
+                'robot_type': 'franka_panda',
+                'gripper_type': self.gripper_backend,
+                'frame_conventions': {
+                    'ee_pose_frame': 'base',
+                    'quaternion_order': '[qx, qy, qz, qw]',
+                    'quaternion_sign_normalized': True,
+                    'gripper_convention_discrete': '0=open, 1=closed',
+                    'gripper_convention_continuous': 'width in meters [close_width, open_width]',
+                },
+                'control_loop_rate_hz': 100,
+                'state_sample_rate_hz': 100,
+                'camera_fps_target': int(getattr(self, 'camera_fps', 60)),
+                'main_loop_rate_hz': int(self.frequency),
+                'data_format_target': self.data_format,
+                'storage_container': 'zarr',
+                'obs_native_layout': 'contiguous + episode_ranges (mirrors data/ + episode_ends)',
+                'calibration_method': 'none yet (extrinsics placeholder; future apriltag)',
+            }
+            (self.output_dir / 'dataset_meta.json').write_text(json.dumps(ds_meta, indent=2))
+        except Exception as e:
+            print(f"[FrankaViveEnv] WARN: dataset_meta.json write failed: {e}")
 
     # ======== Start/Stop API =============
     @property
@@ -695,14 +738,37 @@ class FrankaViveEnv:
             'robot0_gripper_width': gripper_interpolator(gripper_obs_timestamps)
         }
 
-        # Accumulate observations for recording
+        # Accumulate observations for recording. Schema v2:
+        #   - measured state at native rate (controller ~100Hz)
+        #   - includes joint_torque_external + ee linear/angular velocity
+        #     + sign-normalised quaternion (via end_episode post-process)
+        #   - includes per-step commanded values from the controller
+        # All keys here have aligned timestamps == ``robot_timestamp`` (the
+        # batched-fetch receipt time minus receive_latency).
         if self.obs_accumulator is not None:
+            robot_data_for_acc = {
+                'robot0_eef_pose':              last_robot_data['ActualTCPPose'],
+                'robot0_eef_orientation_quat':  last_robot_data['ActualTCPQuat'],
+                'robot0_eef_linear_velocity':   last_robot_data['ActualEELinVel'],
+                'robot0_eef_angular_velocity':  last_robot_data['ActualEEAngVel'],
+                'robot0_joint_pos':             last_robot_data['ActualQ'],
+                'robot0_joint_vel':             last_robot_data['ActualQd'],
+                'robot0_joint_torque_external': last_robot_data['ActualTorquesExt'],
+                # Command stream (recorded alongside state since the
+                # controller emits both at the same 100Hz tick).
+                'cmd_joint_position':           last_robot_data['LastJointCmd'],
+                'cmd_joint_velocity':           last_robot_data['LastJointVelCmd'],
+                'cmd_ee_pose':                  last_robot_data['LastEEPoseCmd'],
+                'cmd_ee_orientation_quat':      last_robot_data['LastEEQuatCmd'],
+                'cmd_ee_linear_velocity':       last_robot_data['LastEELinVelCmd'],
+                'cmd_ee_angular_velocity':      last_robot_data['LastEEAngVelCmd'],
+                'control_mode':                 last_robot_data['ControlMode'].astype(np.float64)
+                                                if hasattr(last_robot_data['ControlMode'], 'astype')
+                                                else np.asarray(last_robot_data['ControlMode'],
+                                                                dtype=np.float64),
+            }
             self.obs_accumulator.put(
-                data={
-                    'robot0_eef_pose': last_robot_data['ActualTCPPose'],
-                    'robot0_joint_pos': last_robot_data['ActualQ'],
-                    'robot0_joint_vel': last_robot_data['ActualQd'],
-                },
+                data=robot_data_for_acc,
                 timestamps=last_robot_data['robot_timestamp']
             )
             self.obs_accumulator.put(
@@ -902,32 +968,101 @@ class FrankaViveEnv:
             print("[FrankaViveEnv] HOME complete. Re-engage clutch (grip) to continue teleop.")
 
     # ========= Recording API =============
-    def start_episode(self, start_time=None, task=None):
+    def start_episode(self, start_time=None, task=None, task_id=None, scene_id=None):
         """Start recording an episode.
+
+        Writes the per-episode metadata atomically (zarr meta + language.json
+        side-car) so a drop_episode call can roll both back consistently.
 
         Args:
             start_time: optional float wall-clock anchor (defaults to now).
-            task: optional language instruction for this episode. If provided,
-                  it is appended to ``replay_buffer.zarr/meta/.attrs['episode_tasks']``
-                  (a list parallel to episode_ends). Converters use this to
-                  populate the per-episode ``tasks`` field of the LeRobot
-                  dataset, eliminating the need to pass ``--task`` at
-                  conversion time.
+            task:       optional language instruction. Required for converters
+                        to populate LeRobot ``tasks`` field; if missing the
+                        converter falls back to its ``--task`` CLI argument.
+            task_id:    optional explicit task identifier. If None, derived
+                        as sha256(normalized(task))[:12] so identical
+                        instructions across sessions collapse to one
+                        LeRobot ``task_index``.
+            scene_id:   optional scene/setup identifier (groups episodes
+                        from the same physical environment).
         """
-        if task is not None:
-            try:
-                import zarr
-                zarr_path = str(self.output_dir.joinpath('replay_buffer.zarr').absolute())
-                root = zarr.open(zarr_path, mode='a')
-                meta = root.require_group('meta')
-                tasks = list(meta.attrs.get('episode_tasks', []))
-                tasks.append(str(task))
-                meta.attrs['episode_tasks'] = tasks
-            except Exception as e:
-                print(f"[FrankaViveEnv] WARN: could not append episode task: {e}")
+        import hashlib, subprocess, uuid, json, datetime
         if start_time is None:
             start_time = time.time()
         self.start_time = start_time
+
+        # Episode metadata block — written atomically below.
+        ep_uuid = str(uuid.uuid4())
+        ts_start_iso = datetime.datetime.fromtimestamp(
+            start_time, tz=datetime.timezone.utc).isoformat()
+
+        # git hash for software_version
+        git_hash = None
+        try:
+            import os
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            git_hash = subprocess.check_output(
+                ['git', '-C', repo_root, 'rev-parse', 'HEAD'],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except Exception:
+            pass
+
+        # task_id derivation (hash-based default, explicit override)
+        if task is not None and task_id is None:
+            normalised = ' '.join(str(task).split()).strip().lower()
+            task_id = hashlib.sha256(normalised.encode('utf-8')).hexdigest()[:12]
+            task_id_source = 'auto_hash'
+        else:
+            task_id_source = 'explicit' if task_id else 'none'
+
+        # Atomic write: zarr meta.attrs + language.json side-car.
+        # If either fails we abort so the two stay in sync (or both empty).
+        try:
+            import zarr
+            zarr_path = str(self.output_dir.joinpath('replay_buffer.zarr').absolute())
+            root = zarr.open(zarr_path, mode='a')
+            meta = root.require_group('meta')
+
+            tasks = list(meta.attrs.get('episode_tasks', []))
+            task_ids = list(meta.attrs.get('episode_task_ids', []))
+            ep_ids = list(meta.attrs.get('episode_ids', []))
+            scene_ids = list(meta.attrs.get('episode_scene_ids', []))
+            sw_versions = list(meta.attrs.get('episode_software_versions', []))
+            start_iso_list = list(meta.attrs.get('episode_start_iso', []))
+
+            tasks.append(str(task) if task is not None else '')
+            task_ids.append(task_id or '')
+            ep_ids.append(ep_uuid)
+            scene_ids.append(str(scene_id) if scene_id is not None else '')
+            sw_versions.append(git_hash or '')
+            start_iso_list.append(ts_start_iso)
+
+            meta.attrs['episode_tasks']             = tasks
+            meta.attrs['episode_task_ids']          = task_ids
+            meta.attrs['episode_ids']               = ep_ids
+            meta.attrs['episode_scene_ids']         = scene_ids
+            meta.attrs['episode_software_versions'] = sw_versions
+            meta.attrs['episode_start_iso']         = start_iso_list
+
+            # language.json side-car (per-episode dir created later in this
+            # function; we put the JSON next to the videos folder for clarity)
+            episode_id = self.replay_buffer.n_episodes
+            ep_dir = self.video_dir.joinpath(str(episode_id))
+            ep_dir.mkdir(parents=True, exist_ok=True)
+            lang_path = ep_dir.joinpath('language.json')
+            lang_path.write_text(json.dumps({
+                'episode_id': ep_uuid,
+                'instruction': str(task) if task is not None else None,
+                'task_id': task_id,
+                'task_id_source': task_id_source,
+                'scene_id': str(scene_id) if scene_id is not None else None,
+                'subtask_annotations': None,
+                'timestamp_start_utc': ts_start_iso,
+                'software_version': git_hash,
+            }, indent=2))
+        except Exception as e:
+            print(f"[FrankaViveEnv] WARN: episode metadata write failed: {e}")
 
         assert self.is_ready
 
@@ -1020,9 +1155,86 @@ class FrankaViveEnv:
                 )
                 episode['robot0_gripper_width'] = gripper_interpolator(timestamps)
 
+                # === Schema v2 new fields (linear-interp scalar/vector) ===
+                # Helper closure so we don't repeat get_interp1d 9 times.
+                from polymetis_franka_teleop.common.rotation_util import (
+                    quat_continuous_within_episode, slerp_at,
+                )
+                def _interp_linear(key):
+                    if key not in self.obs_accumulator.data:
+                        return None
+                    return get_interp1d(
+                        np.array(self.obs_accumulator.timestamps[key]),
+                        np.array(self.obs_accumulator.data[key]),
+                    )(timestamps)
+
+                # Sign-normalise the recorded quaternion stream BEFORE
+                # interpolating, then SLERP into the action grid.
+                quat_ts = np.array(self.obs_accumulator.timestamps.get(
+                    'robot0_eef_orientation_quat', []))
+                quat_data = np.array(self.obs_accumulator.data.get(
+                    'robot0_eef_orientation_quat', []))
+                if quat_data.size > 0:
+                    quat_data = quat_continuous_within_episode(quat_data)
+                    episode['robot0_eef_orientation_quat'] = slerp_at(
+                        quat_ts, quat_data, timestamps)
+
+                cmd_quat_ts = np.array(self.obs_accumulator.timestamps.get(
+                    'cmd_ee_orientation_quat', []))
+                cmd_quat_data = np.array(self.obs_accumulator.data.get(
+                    'cmd_ee_orientation_quat', []))
+                if cmd_quat_data.size > 0:
+                    cmd_quat_data = quat_continuous_within_episode(cmd_quat_data)
+                    episode['action_ee_orientation_quat_cmd'] = slerp_at(
+                        cmd_quat_ts, cmd_quat_data, timestamps)
+
+                # Linear-interp scalar / vector fields
+                for src_key, dst_key in [
+                    ('robot0_eef_linear_velocity',   'robot0_eef_linear_velocity'),
+                    ('robot0_eef_angular_velocity',  'robot0_eef_angular_velocity'),
+                    ('robot0_joint_torque_external', 'robot0_joint_torque_external'),
+                    ('cmd_joint_position',           'action_joint_position_cmd'),
+                    ('cmd_joint_velocity',           'action_joint_velocity_cmd'),
+                    ('cmd_ee_linear_velocity',       'action_ee_linear_velocity_cmd'),
+                    ('cmd_ee_angular_velocity',      'action_ee_angular_velocity_cmd'),
+                ]:
+                    v = _interp_linear(src_key)
+                    if v is not None:
+                        episode[dst_key] = v
+
+                # action_ee_position_cmd: same source as cmd_ee_pose first 3
+                if 'cmd_ee_pose' in self.obs_accumulator.data:
+                    cmd_pose = _interp_linear('cmd_ee_pose')
+                    episode['action_ee_position_cmd'] = cmd_pose[:, :3]
+
+                # control_mode: nearest-neighbour rather than linear (it's
+                # categorical). At least one value per action timestep.
+                if 'control_mode' in self.obs_accumulator.data:
+                    cm_ts   = np.array(self.obs_accumulator.timestamps['control_mode'])
+                    cm_data = np.array(self.obs_accumulator.data['control_mode']).flatten()
+                    # nearest-neighbour lookup
+                    idxs = np.searchsorted(cm_ts, timestamps)
+                    idxs = np.clip(idxs, 0, len(cm_data) - 1)
+                    episode['action_control_mode'] = cm_data[idxs].astype(np.int8)
+
                 self.replay_buffer.add_episode(episode, compressors='disk')
                 episode_id = self.replay_buffer.n_episodes - 1
                 print(f'Episode {episode_id} saved!')
+
+                # === Native-rate stream dump (contiguous + episode_ranges) ===
+                # Schema v2: persist the raw 100Hz proprioception streams
+                # alongside the action-grid view, so a future ACT 50Hz
+                # converter doesn't have to back-fill from a 15Hz signal.
+                # Storage: ~700 KB / 60 s episode << mp4 (~10 MB).
+                self._append_native_rate_stream(episode_id)
+
+                # Camera calibration sidecar (intrinsics now, extrinsics
+                # placeholder for future calib pass).
+                self._write_camera_calib(episode_id)
+
+                # Mark episode success + end timestamp in language.json
+                # (matches start_episode's atomic-write pattern).
+                self._finalise_language_json(episode_id, success=True)
 
             self.obs_accumulator = None
             self.action_accumulator = None
@@ -1035,4 +1247,178 @@ class FrankaViveEnv:
         this_video_dir = self.video_dir.joinpath(str(episode_id))
         if this_video_dir.exists():
             shutil.rmtree(str(this_video_dir))
+        # Also roll back the matching native-rate range row, if present.
+        try:
+            import zarr
+            root = zarr.open(str(self.output_dir.joinpath('replay_buffer.zarr').absolute()), 'a')
+            if 'obs_native_episode_ranges' in root.get('meta', {}):
+                rng = root['meta']['obs_native_episode_ranges']
+                if rng.shape[0] > episode_id:
+                    # Truncate every obs_native key back to the row's start.
+                    start = int(rng[episode_id, 0])
+                    if 'obs_native' in root:
+                        for k in list(root['obs_native'].array_keys()):
+                            root['obs_native'][k].resize(start, *root['obs_native'][k].shape[1:])
+                    rng.resize(episode_id, 2)
+        except Exception as e:
+            print(f'[FrankaViveEnv] WARN: drop_episode native-rate rollback failed: {e}')
         print(f'Episode {episode_id} dropped!')
+
+    def _finalise_language_json(self, episode_id: int, success: bool) -> None:
+        """Stamp end_iso + success on the per-episode language.json. The
+        start half was written in ``start_episode`` so this just rounds out
+        the record. Idempotent — safe to call multiple times."""
+        import datetime, json
+        try:
+            ep_dir = self.video_dir.joinpath(str(episode_id))
+            path = ep_dir.joinpath('language.json')
+            if not path.exists():
+                return
+            doc = json.loads(path.read_text())
+            doc['timestamp_end_utc'] = datetime.datetime.now(
+                tz=datetime.timezone.utc).isoformat()
+            doc['success'] = bool(success)
+            path.write_text(json.dumps(doc, indent=2))
+        except Exception as e:
+            print(f"[FrankaViveEnv] WARN: language.json finalise failed: {e}")
+
+    def _write_camera_calib(self, episode_id: int) -> None:
+        """Dump per-camera intrinsics + extrinsics (placeholder) JSON.
+
+        Schema is defined now so downstream (rerun replay, calib tooling)
+        has a stable target. ``extrinsics`` is filled with ``null`` and
+        marked ``measured=false`` until a real calibration is performed.
+        Intrinsics are pulled from the camera worker's ``intrinsics_array``
+        SHM (populated at boot from the ZED SDK / RealSense SDK).
+        """
+        import json
+        try:
+            ep_dir = self.video_dir.joinpath(str(episode_id))
+            calib_dir = ep_dir.joinpath('calibration')
+            calib_dir.mkdir(parents=True, exist_ok=True)
+            # MultiZed / MultiRealsense exposes per-cam SingleZed workers via
+            # ``.cameras`` (a dict / list). Each worker has ``intrinsics_array``
+            # (fx, fy, cx, cy, h, w, baseline) and ``serial_number``.
+            cams = getattr(self.camera, 'cameras', None) or {}
+            for i, cam_idx in enumerate(sorted(cams.keys()) if isinstance(cams, dict) else range(len(cams))):
+                worker = cams[cam_idx] if isinstance(cams, dict) else cams[i]
+                try:
+                    intr = worker.intrinsics_array.get().copy()
+                    fx, fy, cx, cy, h, w, baseline = [float(x) for x in intr[:7]]
+                except Exception:
+                    fx = fy = cx = cy = h = w = baseline = 0.0
+                serial = int(getattr(worker, 'serial_number', 0))
+                calib = {
+                    'index': int(cam_idx) if isinstance(cam_idx, int) else i,
+                    'model': type(worker).__name__,                  # SingleZed / SingleRealsense
+                    'serial': serial,
+                    'intrinsics': {
+                        'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy,
+                        'width': int(w), 'height': int(h),
+                        'baseline_m': baseline,                       # stereo baseline (ZED)
+                        'distortion_model': 'none',                   # ZED LEFT eye is rectified
+                        'distortion_coeffs': [],
+                    },
+                    # Camera-to-base 4x4 SE(3). To be filled by a future
+                    # calibration step (apriltag / checkerboard); the schema
+                    # is fixed now so downstream tools (rerun-io, etc.)
+                    # don't need a follow-up migration.
+                    'extrinsics': {
+                        'measured': False,
+                        'position_xyz_m': None,                       # [x, y, z]
+                        'orientation_quat_xyzw': None,                # [qx, qy, qz, qw]
+                    },
+                }
+                fname = calib_dir.joinpath(f'cam_{i}.json')
+                fname.write_text(json.dumps(calib, indent=2))
+        except Exception as e:
+            print(f"[FrankaViveEnv] WARN: camera calib export failed: {e}")
+
+    def _append_native_rate_stream(self, episode_id: int) -> None:
+        """Append the current ObsAccumulator's raw streams to obs_native/.
+
+        Layout decision (see ``dataset_meta.json``): **contiguous arrays
+        + episode_ranges**, matching the existing ``data/`` group's
+        episode_ends pattern. Each obs_native key is one variable-length
+        sequence concatenated across episodes; ``meta/obs_native_episode_ranges``
+        (E, 2) gives ``[start, end]`` per episode for slicing.
+        """
+        import zarr
+        if self.obs_accumulator is None:
+            return
+        try:
+            root = zarr.open(str(self.output_dir.joinpath('replay_buffer.zarr').absolute()), 'a')
+            native = root.require_group('obs_native')
+            meta = root.require_group('meta')
+
+            # The fields we persist at native rate. Quaternion is the
+            # already-sign-normalised raw stream (no SLERP — caller does
+            # that at conversion time).
+            from polymetis_franka_teleop.common.rotation_util import (
+                quat_continuous_within_episode,
+            )
+            ts_robot = np.array(self.obs_accumulator.timestamps.get('robot0_joint_pos', []))
+            if ts_robot.size == 0:
+                return
+
+            quat_raw = np.array(self.obs_accumulator.data.get(
+                'robot0_eef_orientation_quat', np.zeros((0, 4))))
+            if quat_raw.size > 0:
+                quat_raw = quat_continuous_within_episode(quat_raw)
+
+            robot_streams = {
+                'ts_robot':                     ts_robot.astype(np.float64),
+                'joint_position':               np.array(self.obs_accumulator.data['robot0_joint_pos']),
+                'joint_velocity':               np.array(self.obs_accumulator.data['robot0_joint_vel']),
+                'joint_torque_external':        np.array(self.obs_accumulator.data.get(
+                    'robot0_joint_torque_external', np.zeros((len(ts_robot), 7)))),
+                'ee_pose_axis_angle':           np.array(self.obs_accumulator.data['robot0_eef_pose']),
+                'ee_orientation_quat':          quat_raw,
+                'ee_linear_velocity':           np.array(self.obs_accumulator.data.get(
+                    'robot0_eef_linear_velocity', np.zeros((len(ts_robot), 3)))),
+                'ee_angular_velocity':          np.array(self.obs_accumulator.data.get(
+                    'robot0_eef_angular_velocity', np.zeros((len(ts_robot), 3)))),
+            }
+            ts_gripper = np.array(self.obs_accumulator.timestamps.get('robot0_gripper_width', []))
+            gripper_streams = {
+                'ts_gripper':       ts_gripper.astype(np.float64),
+                'gripper_position': np.array(self.obs_accumulator.data['robot0_gripper_width']).reshape(-1, 1),
+            }
+
+            # Append (or create) each contiguous array.
+            for key, arr in {**robot_streams, **gripper_streams}.items():
+                arr = np.asarray(arr)
+                if key in native:
+                    ds = native[key]
+                    old_n = ds.shape[0]
+                    new_shape = (old_n + arr.shape[0],) + arr.shape[1:]
+                    ds.resize(*new_shape)
+                    ds[old_n:] = arr
+                else:
+                    native.create_dataset(key, data=arr, chunks=(min(4096, arr.shape[0] or 1),)
+                                          + arr.shape[1:])
+
+            # Update episode_ranges (E, 2) for both robot + gripper streams.
+            # Two ranges per episode because robot + gripper have different
+            # lengths. Store as a single (E, 2, 2) so each episode row gives
+            # [[r_start, r_end], [g_start, g_end]].
+            r_end = native['ts_robot'].shape[0]
+            r_start = r_end - ts_robot.shape[0]
+            g_end = native['ts_gripper'].shape[0]
+            g_start = g_end - ts_gripper.shape[0]
+            row = np.array([[r_start, r_end], [g_start, g_end]], dtype=np.int64)
+
+            if 'obs_native_episode_ranges' in meta:
+                rng = meta['obs_native_episode_ranges']
+                # Pad to episode_id+1 if needed (in case of out-of-order
+                # writes — shouldn't happen but defensive).
+                if rng.shape[0] < episode_id + 1:
+                    rng.resize(episode_id + 1, 2, 2)
+                rng[episode_id] = row
+            else:
+                ranges = np.zeros((episode_id + 1, 2, 2), dtype=np.int64)
+                ranges[episode_id] = row
+                meta.create_dataset('obs_native_episode_ranges', data=ranges,
+                                    chunks=(64, 2, 2))
+        except Exception as e:
+            print(f'[FrankaViveEnv] WARN: native-rate dump failed: {e}')
