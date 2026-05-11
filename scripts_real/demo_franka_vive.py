@@ -146,6 +146,16 @@ def run_preflight_check(expected_cameras: int = 2):
                    'encoding consumes too much CPU.')
 @click.option('--skip_preflight', is_flag=True, default=False, help='Skip preflight check')
 @click.option('--verbose', '-v', is_flag=True, default=False, help='Enable verbose output')
+@click.option('--task', default=None, type=str,
+              help='Default task instruction (str) applied to every episode recorded in this '
+                   'session. Forwarded to env.start_episode(task=...) which writes it to '
+                   'videos/<ep>/language.json::instruction. Required for GR00T conversion '
+                   '(or pass --allow-placeholder to convert_to_gr00t_droid.py for sandbox '
+                   'sessions). If None (default), language.json::instruction stays null.')
+@click.option('--task_id', default=None, type=str,
+              help='Explicit task identifier. If --task is set and --task_id is None, '
+                   'env auto-derives a 12-char sha256 of the task string. Override only '
+                   'when grouping sessions with the same instruction under distinct IDs.')
 def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
          camera_backend, gripper_backend, art_gripper_host, art_gripper_port,
          camera_serials, camera_resolution, camera_fps, obs_resolution,
@@ -154,7 +164,7 @@ def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
          velocity_clamp, max_pos_velocity, max_rot_velocity,
          data_format, auto_home, grip_force, gripper_close_width,
          vis, vis_throttle_n,
-         skip_preflight, verbose):
+         skip_preflight, verbose, task, task_id):
 
     # ---- Resolve tuning preset ----
     # Each preset is (pos_scale, rot_scale, Kx_scale, Kxd_scale, vel_clamp, max_pos_v, max_rot_v)
@@ -456,7 +466,8 @@ def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
                     stop = True
                 elif last_key == ord('c'):
                     env.start_episode(
-                        t_start + (iter_idx + 2) * dt - time.monotonic() + time.time())
+                        t_start + (iter_idx + 2) * dt - time.monotonic() + time.time(),
+                        task=task, task_id=task_id)
                     is_recording = True
                     print('Recording!')
                 elif last_key == ord('s'):
@@ -491,7 +502,8 @@ def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
                     sig_record_request[0] = None
                     if not is_recording:
                         env.start_episode(
-                            t_start + (iter_idx + 2) * dt - time.monotonic() + time.time())
+                            t_start + (iter_idx + 2) * dt - time.monotonic() + time.time(),
+                            task=task, task_id=task_id)
                         is_recording = True
                         print('Recording!')
                     else:
