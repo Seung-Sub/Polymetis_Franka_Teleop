@@ -487,6 +487,27 @@ class FrankaViveEnv:
         Idempotent — overwrites on every __init__. Stored as a JSON-serializable
         dict so that converters can `zarr.open(...).require_group("meta").attrs`.
         """
+        # ART / Franka Hand mechanical widths for the gripper convention
+        # block below. ART firmware accepts a full 0 mm close; Franka
+        # Hand's libfranka rejects width=0 so we use a 5 mm floor.
+        _max_width_m = {
+            'art_gripper': 0.095,
+            'franka_hand': 0.075,
+        }
+        # Single source of truth for the gripper convention; written into
+        # both zarr ``meta.attrs`` and the dataset_meta.json side-car so
+        # converters get the same structured dict regardless of which they
+        # read.
+        gripper_convention = {
+            'signal': 'gripper_position',
+            'unit': 'meters',
+            'direction': '0 = mechanically closed, max_width = fully open',
+            'max_width_m': _max_width_m,
+            'normalization_for_droid': (
+                'normalized = width / max_width  '
+                '(0=closed, 1=open, matches DROID/spec)'
+            ),
+        }
         try:
             import zarr
             zarr_path = str(self.output_dir.joinpath('replay_buffer.zarr').absolute())
@@ -515,7 +536,7 @@ class FrankaViveEnv:
             meta.attrs['quaternion_order']         = '[qx, qy, qz, qw]'
             meta.attrs['quaternion_sign_normalised'] = True
             meta.attrs['ee_pose_frame']            = 'base'
-            meta.attrs['gripper_convention']       = '0=open, 1=closed (binary toggle); width in meters (continuous)'
+            meta.attrs['gripper_convention']       = gripper_convention
             meta.attrs['robot_type']               = 'franka_panda'
             meta.attrs['teleop_device']            = 'vive_pro_controller'
             meta.attrs['obs_native_layout']        = 'contiguous + episode_ranges'
@@ -529,13 +550,6 @@ class FrankaViveEnv:
         # attrs). Layout matches data_pipeline_spec.md §4.
         try:
             import json
-            # ART / Franka Hand mechanical widths for the gripper convention
-            # block below. ART firmware accepts a full 0 mm close; Franka
-            # Hand's libfranka rejects width=0 so we use a 5 mm floor.
-            _max_width_m = {
-                'art_gripper': 0.095,
-                'franka_hand': 0.075,
-            }
             ds_meta = {
                 'dataset_name': self.output_dir.name,
                 'version': '2.0.0',
@@ -554,16 +568,7 @@ class FrankaViveEnv:
                     'quaternion_order': '[qx, qy, qz, qw]',
                     'quaternion_sign_normalized': True,
                 },
-                'gripper_convention': {
-                    'signal': 'gripper_position (zarr key: robot0_gripper_width)',
-                    'unit': 'meters',
-                    'direction': '0 = mechanically closed, max_width = fully open',
-                    'max_width_m': _max_width_m,
-                    'normalization_for_droid': (
-                        'normalized = width / max_width '
-                        '(0=closed, 1=open, matches DROID/spec direction)'
-                    ),
-                },
+                'gripper_convention': gripper_convention,
                 'control_loop_rate_hz': 100,
                 'state_sample_rate_hz': 100,
                 'camera_fps_target': int(getattr(self, 'camera_fps', 60)),
@@ -609,6 +614,8 @@ class FrankaViveEnv:
                     '(axis-angle wraparound spike detector; 100 Hz x 0.1 rad = 10 rad/s normal upper)',
                     'obs_native_episode_ranges aligns with episode_ends (no orphan rows)',
                     'quaternion sign continuity: max consecutive dot product is >= 0',
+                    'obs_native key set matches _NATIVE_ROBOT_KEYS | _NATIVE_GRIPPER_KEYS '
+                    '(no orphan keys; warns if new key added without constant update)',
                 ],
             }
             (self.output_dir / 'dataset_meta.json').write_text(json.dumps(ds_meta, indent=2))
@@ -1338,6 +1345,31 @@ class FrankaViveEnv:
         'episode_start_iso',
     )
 
+    # Native-rate stream key partition. Robot and gripper streams have
+    # independent lengths (each appended from its own ObsAccumulator
+    # timestamps) so ``drop_episode`` must truncate them to different
+    # start offsets — robot keys to ``rng[ep, 0, 0]``, gripper keys to
+    # ``rng[ep, 1, 0]``. Keep these in lock-step with the dicts built
+    # inside ``_append_native_rate_stream``. A future health-check
+    # (``validation_checks_planned``) flags drift; until then, any key
+    # written by ``_append_native_rate_stream`` but missing here is
+    # **skipped with a WARN** rather than truncated to the wrong stream
+    # (silent data corruption is worse than orphan rows + a log line).
+    _NATIVE_ROBOT_KEYS = frozenset({
+        'ts_robot',
+        'joint_position',
+        'joint_velocity',
+        'joint_torque_external',
+        'ee_pose_axis_angle',
+        'ee_orientation_quat',
+        'ee_linear_velocity',
+        'ee_angular_velocity',
+    })
+    _NATIVE_GRIPPER_KEYS = frozenset({
+        'ts_gripper',
+        'gripper_position',
+    })
+
     def _assert_episode_meta_consistency(self, pending: bool) -> None:
         """Assert the 6 per-episode meta lists agree with n_episodes.
 
@@ -1434,17 +1466,40 @@ class FrankaViveEnv:
                 steps_failed.append((f'rmtree videos/{episode_id}', str(e)))
 
         # Step 5: truncate obs_native/* + meta/obs_native_episode_ranges.
+        # ``rng`` has shape ``(E, 2, 2)`` -- [[r_start, r_end], [g_start, g_end]]
+        # per episode. Robot and gripper streams are independent and must
+        # be truncated to *different* start offsets. Unknown keys (not in
+        # _NATIVE_ROBOT_KEYS | _NATIVE_GRIPPER_KEYS) are left alone with
+        # a WARN -- truncating to the wrong stream's offset would silently
+        # corrupt data.
         try:
             import zarr
             root = zarr.open(str(self.output_dir.joinpath('replay_buffer.zarr').absolute()), 'a')
             if 'obs_native_episode_ranges' in root.get('meta', {}):
                 rng = root['meta']['obs_native_episode_ranges']
                 if rng.shape[0] > episode_id:
-                    start = int(rng[episode_id, 0])
+                    r_start = int(rng[episode_id, 0, 0])
+                    g_start = int(rng[episode_id, 1, 0])
+                    unknown = []
                     if 'obs_native' in root:
                         for k in list(root['obs_native'].array_keys()):
-                            root['obs_native'][k].resize(start, *root['obs_native'][k].shape[1:])
-                    rng.resize(episode_id, 2)
+                            if k in self._NATIVE_ROBOT_KEYS:
+                                new_start = r_start
+                            elif k in self._NATIVE_GRIPPER_KEYS:
+                                new_start = g_start
+                            else:
+                                unknown.append(k)
+                                continue
+                            root['obs_native'][k].resize(
+                                new_start, *root['obs_native'][k].shape[1:])
+                    rng.resize(episode_id, 2, 2)
+                    if unknown:
+                        print(f'[FrankaViveEnv] WARN: drop_episode skipped '
+                              f'unknown obs_native keys (not in '
+                              f'_NATIVE_ROBOT_KEYS | _NATIVE_GRIPPER_KEYS): '
+                              f'{unknown}. Manual cleanup needed -- consider '
+                              f'adding the new key to the appropriate '
+                              f'constant.', flush=True)
                     steps_completed.append('obs_native truncate')
         except Exception as e:
             steps_failed.append(('obs_native truncate', str(e)))
@@ -1531,6 +1586,20 @@ class FrankaViveEnv:
                         'position_xyz_m': None,                       # [x, y, z]
                         'orientation_quat_xyzw': None,                # [qx, qy, qz, qw]
                     },
+                    # F2-path: per-frame capture timestamps for this camera +
+                    # episode. ``single_zed`` worker dumps these to the path
+                    # below on STOP_RECORDING (async w.r.t. this write, so
+                    # the npy may not exist yet at the moment cam_<i>.json is
+                    # written -- existence is checked post-hoc, e.g. in
+                    # check_dataset_health.py). Path is **session-root
+                    # relative** so converters can resolve as
+                    # ``os.path.join(session_dir, frame_timestamps_path)``.
+                    'frame_timestamps_path': (
+                        f'videos/{episode_id}/cam_{i}_frame_timestamps.npy'),
+                    'frame_timestamps_clock': (
+                        'monotonic, latency-compensated '
+                        '(single_zed calibrated_time)'),
+                    'frame_timestamps_unit': 'seconds',
                 }
                 fname = calib_dir.joinpath(f'cam_{i}.json')
                 fname.write_text(json.dumps(calib, indent=2))
