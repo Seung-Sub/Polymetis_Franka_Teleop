@@ -351,7 +351,7 @@ def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
             print('  Keyboard c: Start recording')
             print('  Keyboard s: Stop recording and save')
             print('  Keyboard h: Move to HOME position (keyboard fallback)')
-            print('  Keyboard Backspace: Drop episode (then Y to confirm, N to cancel)')
+            print('  Keyboard d (or Backspace): Drop episode (then Y to confirm, N to cancel)')
             print('  Keyboard q: Quit')
             print('')
             print(f'Camera: {cam_width}x{cam_height} @ {camera_fps}fps')

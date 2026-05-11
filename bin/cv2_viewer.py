@@ -120,9 +120,17 @@ def main():
                 elif key == ord('h'):
                     print('[cv2_viewer] h pressed -> SIGHUP (home)', flush=True)
                     os.kill(args.signal_pid, signal.SIGHUP)
-                elif key in (8, 127):  # Backspace (8) or Delete (127)
+                elif key == ord('d') or key in (8, 127):
+                    # 'd' is the primary drop-arm key (mnemonic, always
+                    # delivered by cv2.waitKey under all X / Wayland / Qt /
+                    # GTK builds). Backspace (8) / Delete (127) kept as
+                    # fallbacks for keyboards/WMs that don't intercept them
+                    # at the system level (some GTK setups grab Backspace
+                    # as a navigation shortcut and the keypress never
+                    # reaches cv2.waitKey, which is the failure mode
+                    # observed at KIST 2026-05-11).
                     drop_armed_t = time.monotonic()
-                    print('[cv2_viewer] Backspace -- press y within 5 s to '
+                    print('[cv2_viewer] d/Backspace -- press y within 5 s to '
                           'confirm drop, n to cancel', flush=True)
                 elif key == ord('y'):
                     if drop_armed_t > 0.0:
@@ -134,6 +142,15 @@ def main():
                     if drop_armed_t > 0.0:
                         print('[cv2_viewer] n pressed -- drop cancelled', flush=True)
                         drop_armed_t = 0.0
+                else:
+                    # Unrecognised key — print the keycode (after the
+                    # & 0xFF mask) so future "key X doesn't work"
+                    # debugging has data instead of silence. ASCII chr if
+                    # printable so the operator immediately sees which
+                    # key fired.
+                    ch = chr(key) if 32 <= key < 127 else '?'
+                    print(f'[cv2_viewer] unrecognised keycode {key} '
+                          f'({ch!r}); no signal sent', flush=True)
             except ProcessLookupError:
                 # demo is gone — exit viewer too
                 break
