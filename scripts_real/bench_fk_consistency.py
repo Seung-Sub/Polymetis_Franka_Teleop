@@ -24,18 +24,24 @@ Margins
 -------
 Tuned for "no controller, static pose, same pinocchio model on both
 sides". Loosened where two independent RPCs to a noisy sensor are being
-compared (joint velocity, external torque -- ``tau_ext_hat_filtered``
-is a server-side filter output and naturally jitters between snapshots).
+compared (joint position/velocity, external torque). The legacy and
+batched paths poll polymetis at slightly different wallclock times --
+gravity-comp residual motion at ``|qd| ~ 1e-3 rad/s`` produces
+``|Δq| ~ qd × Δt_RPC ~ 1e-5 .. 1e-4 rad`` drift between any two
+back-to-back ``get_joint_positions`` calls. The joint-pos margin is
+set so that this real-physics drift PASSes and only a true FK divergence
+(e.g. different URDF on server vs client) would trip it. Same reasoning
+already applied to joint-vel and torque_ext.
 
-    | metric         | margin       | rationale                            |
-    |----------------|--------------|--------------------------------------|
-    | TCP pos        | < 0.1 mm     | same pinocchio model => sub-um real  |
-    | TCP rot        | < 0.01 deg   | same pinocchio model => sub-mdeg real|
-    | flange pos     | < 0.1 mm     | rigid transform of TCP, same model   |
-    | flange rot     | < 0.01 deg   | same                                 |
-    | joint position | < 1e-5 rad   | franka encoder ~1e-6 rad             |
-    | joint velocity | < 1e-2 rad/s | sensor noise + grav-comp wobble      |
-    | torque_ext     | < 0.05 Nm    | filter output, different snapshots   |
+    | metric         | margin       | rationale                              |
+    |----------------|--------------|----------------------------------------|
+    | TCP pos        | < 0.1 mm     | same pinocchio model => sub-um real    |
+    | TCP rot        | < 0.01 deg   | same pinocchio model => sub-mdeg real  |
+    | flange pos     | < 0.1 mm     | rigid transform of TCP, same model     |
+    | flange rot     | < 0.01 deg   | same                                   |
+    | joint position | < 1e-4 rad   | qd × Δt_RPC drift (aligned with qd)    |
+    | joint velocity | < 1e-2 rad/s | sensor noise + grav-comp wobble        |
+    | torque_ext     | < 0.05 Nm    | filter output, different snapshots     |
 
 If anything exceeds its margin, the most likely cause is that the
 polymetis server and the in-process pinocchio model are loading
@@ -60,7 +66,7 @@ from polymetis_franka_teleop.real_world.franka_interpolation_controller import (
 _MARGINS = {
     'TCP pos diff':    (0.1,    'mm'),
     'TCP rot diff':    (0.01,   'deg'),
-    'joint pos diff':  (1e-5,   'rad'),
+    'joint pos diff':  (1e-4,   'rad'),     # see docstring: qd x dt_RPC drift
     'joint vel diff':  (1e-2,   'rad/s'),
     'flange pos diff': (0.1,    'mm'),
     'flange rot diff': (0.01,   'deg'),
