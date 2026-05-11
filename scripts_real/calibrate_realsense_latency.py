@@ -41,6 +41,7 @@ os.chdir(ROOT_DIR)
 
 import click
 import time
+from datetime import date
 import numpy as np
 from multiprocessing.managers import SharedMemoryManager
 from matplotlib import pyplot as plt
@@ -79,7 +80,9 @@ def check_global_time_support(serial_number=None):
 @click.option('--fps', '-f', type=int, default=30, help='Camera FPS')
 @click.option('--duration', '-d', type=float, default=5.0, help='Capture duration in seconds')
 @click.option('--resolution', type=(int, int), default=(640, 480), help='Camera resolution')
-def main(serial, fps, duration, resolution):
+@click.option('--patch/--no_patch', default=True,
+              help='Write the measured median into install/latency_calibration.json')
+def main(serial, fps, duration, resolution, patch):
     """Calibrate RealSense camera latency using hardware timestamps."""
 
     print("=" * 60)
@@ -331,6 +334,22 @@ def main(serial, fps, duration, resolution):
     )
 
     print(f"\nResults saved to: {results_path}/realsense_latency_v2_{timestamp_str}.*")
+
+    if patch and obs_latency > 0:
+        try:
+            from polymetis_franka_teleop.common.latency_config import patch_calibration
+            updates = {
+                'camera_obs_latency': {'realsense': float(round(obs_latency, 4))},
+                '_calibration_dates': {'camera_realsense': date.today().isoformat()},
+            }
+            print()
+            print('  Writing to install/latency_calibration.json:')
+            for k, v in updates.items():
+                print(f'    {k} = {v}')
+            p = patch_calibration(updates)
+            print(f'  patched: {p}')
+        except Exception as e:
+            print(f'  [WARN] could not patch JSON: {e}')
 
     plt.show()
 

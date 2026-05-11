@@ -1,25 +1,25 @@
 {
   "_about": "Per-channel latency constants used by FrankaViveEnv / FrankaPolicyEnv. Auto-managed by scripts_real/calibrate_*.py via polymetis_franka_teleop.common.latency_config helpers. Values in seconds.",
   "camera_obs_latency": {
-    "zed": 0.015,
+    "zed": 0.0099,
     "realsense": 0.015
   },
   "robot_obs_latency": 0.001,
   "gripper_obs_latency": {
     "franka": 0.001,
-    "art": 0.001
+    "art": 0.0051
   },
   "robot_action_latency": 0.055,
   "gripper_action_latency": {
     "franka": 0.085,
-    "art": 0.085
+    "art": 0.0847
   },
   "_calibration_dates": {
-    "camera_zed": null,
+    "camera_zed": "2026-05-11",
     "camera_realsense": "2026-01-25",
     "robot": "2026-01-25",
     "gripper_franka": "2026-01-25",
-    "gripper_art": null
+    "gripper_art": "2026-05-11"
   },
   "_notes": {
     "camera_zed": "TODO: calibrate with scripts_real/calibrate_zed_latency.py (ZED uses proprietary SDK timestamps, not RealSense HW timestamps -- value reused from RealSense as a placeholder).",
