@@ -157,12 +157,13 @@ class FrankaPolicyEnv:
             verbose=False
             ):
 
-        # Backend-specific defaults
+        # Backend-specific defaults from the central registry.
+        from polymetis_franka_teleop.common.gripper_specs import get_spec
+        spec = get_spec(gripper_backend)
         if tcp_offset is None:
-            tcp_offset = 0.216 if gripper_backend == 'art' else 0.1034
-        if gripper_backend == 'art':
-            if gripper_open_width <= 0.075 + 1e-9:
-                gripper_open_width = 0.095
+            tcp_offset = spec.tcp_offset
+        if gripper_backend == 'art' and gripper_open_width <= 0.075 + 1e-9:
+            gripper_open_width = spec.open_width
 
         # Resolve latency constants from install/latency_calibration.json (or
         # hardcoded V3 fallback inside latency_config) when caller passed None.

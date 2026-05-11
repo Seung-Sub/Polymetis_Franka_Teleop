@@ -1,40 +1,31 @@
-"""
-FrankaGripperController for Franka Panda default gripper.
-Based on UMI's WSGController structure, using ZeroRPC to communicate with gripper server.
+"""FrankaGripperController for the Franka Panda default gripper (Franka Hand).
+
+Talks to fairo-polymetis' GripperServerLauncher over gRPC :50052 (NOT zerorpc;
+see /home/kist/fairo/polymetis/polymetis/conf/launch_gripper.yaml — port: 50052
+and gripper_interface.py which uses ``grpc.insecure_channel``).
 
 Key features:
-- Runs in separate process to avoid Python GIL
-- SIMPLIFIED: No interpolation - direct OPEN/CLOSE commands (matches data collection)
-- Compatible with UMI's schedule_waypoint API
-- SharedMemory-based inter-process communication
-- Teleop mode for direct gripper control from ViveTeleopProcess
+- Runs in separate process to avoid Python GIL.
+- DISCRETE OPEN/CLOSE commands (matches recorded action semantics — see
+  ``ArtGripperController`` for the matching pattern).
+- Same UMI ``schedule_waypoint(width, target_time)`` API as ArtGripperController.
+- Non-blocking ``goto`` / ``grasp`` (``blocking=False``) so the controller loop
+  does not stall during gripper motion (catalog #30 pattern from ART).
 
-IMPORTANT DESIGN DECISION (v2.0):
-- Data collection records binary gripper states (OPEN or CLOSE)
-- Policy outputs are also essentially binary
-- Therefore, interpolation is UNNECESSARY and adds latency
-- This version detects state transitions and sends single commands
-
-Requirements:
-- ZeroRPC interface server running on NUC
-- zerorpc Python package installed
+Wire-up (NUC):
+    sudo bash /usr/local/sbin/start_franka_gripper.sh
+    -> python launch_gripper.py gripper=franka_hand
+    -> GripperServerLauncher on :50052 (gRPC)
 
 Gripper specifications (Franka Hand):
-- Width range: 0.0 to 0.08 meters (0 to 80mm) physical max
-- Usable range for training: 0.0 to 0.075 meters (0 to 75mm) to match observation
-- Max speed: ~0.2 m/s
-- Grasp force: 0.01 to 70 N (recommended: 5-40 N)
+- Width range: 0.0 to 0.08 meters (80 mm) physical max; usable 0.005-0.075 m
+  (libfranka raises on width=0.0 → 5 mm safety margin on close_width).
+- Max speed: ~0.2 m/s.
+- Grasp force: 0.01 to 70 N.
 
-Usage:
-    with SharedMemoryManager() as shm_manager:
-        with FrankaGripperController(
-            shm_manager=shm_manager,
-            robot_ip='172.16.0.2'
-        ) as gripper_controller:
-            # Get gripper state
-            state = gripper_controller.get_state()
-            # Schedule command (only executes on state change)
-            gripper_controller.schedule_waypoint(width=0.04, target_time=time.time()+1)
+Backend metadata (port, width envelope, default force, TCP offset) lives in
+``polymetis_franka_teleop.common.gripper_specs.GRIPPER_SPECS['franka']``;
+this controller honours whatever is passed in.
 """
 
 import os
@@ -60,33 +51,25 @@ class Command(enum.Enum):
 
 class FrankaGripperController(mp.Process):
     """
-    Controller for Franka Panda default gripper using ZeroRPC.
+    Controller for the Franka Panda default gripper via fairo-polymetis gRPC :50052.
 
-    This controller runs in a separate process and provides DISCRETE
-    command execution (OPEN or CLOSE) matching data collection behavior.
-
-    v2.0 Changes:
-    - Removed PoseTrajectoryInterpolator (unnecessary for binary gripper)
-    - Commands are queued with timestamps and executed at scheduled time
-    - Single OPEN or CLOSE command per state transition
-    - Reduced latency by removing interpolation overhead
-
-    Teleop Mode:
-    When teleop_mode=True, the controller reads gripper commands directly
-    from teleop_ring_buffer (from ViveTeleopProcess) for immediate response.
+    Discrete OPEN/CLOSE state machine matching recorded action semantics,
+    non-blocking command issue, teleop-mode hot path that reads directly
+    from ViveTeleopProcess's ring buffer.
 
     Args:
         shm_manager: SharedMemoryManager for inter-process communication
-        robot_ip: IP address of the ZeroRPC server (same as robot NUC)
-        gripper_port: Port of the ZeroRPC gripper server (default: 4242)
-        frequency: Control frequency in Hz (default: 30)
-        move_max_speed: Maximum gripper speed in m/s (default: 0.2)
-        get_max_k: Maximum number of states to buffer (default: frequency * 10)
-        launch_timeout: Timeout for controller startup (default: 3s)
-        receive_latency: Latency compensation for state timestamps (default: 0.0)
-        verbose: Enable verbose logging (default: False)
-        teleop_mode: Enable teleop mode (bypass schedule_waypoint) (default: False)
-        teleop_ring_buffer: SharedMemoryRingBuffer from ViveTeleopProcess (required if teleop_mode=True)
+        robot_ip: IP of the polymetis Franka Hand gRPC server (NUC, default 192.168.1.12)
+        gripper_port: gRPC port (default 50052, matches conf/launch_gripper.yaml)
+        frequency: Control loop frequency in Hz (default 60)
+        move_max_speed: Default gripper speed in m/s
+        get_max_k: Max ring-buffer history (default frequency * 10)
+        launch_timeout: Spawn timeout (s)
+        receive_latency: Subtracted from state timestamps (latency compensation)
+        verbose: Verbose logging
+        teleop_mode: Read commands from teleop_ring_buffer (bypass input queue)
+        teleop_ring_buffer: required iff teleop_mode=True
+        gripper_open_width / gripper_close_width: Backend-specific width envelope
     """
 
     # Franka Hand specifications
@@ -103,19 +86,18 @@ class FrankaGripperController(mp.Process):
     def __init__(self,
             shm_manager: SharedMemoryManager,
             robot_ip: str,
-            gripper_port: int = 4242,
+            gripper_port: int = 50052,         # fairo-polymetis launch_gripper.yaml default
             frequency: int = 60,
             move_max_speed: float = 0.2,
             get_max_k: int = None,
             command_queue_size: int = 1024,
             launch_timeout: float = 3.0,
             receive_latency: float = 0.0,
-            use_unified_server: bool = True,
             verbose: bool = False,
             teleop_mode: bool = False,
             teleop_ring_buffer: SharedMemoryRingBuffer = None,
-            gripper_open_width: float = 0.075,  # Gripper width when open (default: 75mm, matches obs max)
-            gripper_close_width: float = 0.005,   # Gripper width when closed (default: 5mm, avoid 0 which causes libfranka exception)
+            gripper_open_width: float = 0.075,  # Franka Hand obs max
+            gripper_close_width: float = 0.005, # 5 mm safety (libfranka raises on 0.0)
             ):
         # Validate teleop mode configuration
         if teleop_mode and teleop_ring_buffer is None:
@@ -124,7 +106,6 @@ class FrankaGripperController(mp.Process):
         super().__init__(name="FrankaGripperController")
         self.robot_ip = robot_ip
         self.gripper_port = gripper_port
-        self.use_unified_server = use_unified_server
         self.frequency = frequency
         self.move_max_speed = move_max_speed
         self.launch_timeout = launch_timeout
@@ -292,27 +273,37 @@ class FrankaGripperController(mp.Process):
     # ========= Main loop in process ============
     def run(self):
         try:
-            # Use ZeroRPC to communicate with gripper server on NUC
-            import zerorpc
+            # fairo-polymetis Franka Hand uses gRPC :50052. The
+            # ``GripperInterface`` thin wrapper handles connect + protobuf.
+            from polymetis import GripperInterface
 
-            # Connect to gripper ZeroRPC server
-            gripper = zerorpc.Client(heartbeat=20)
-            gripper.connect(f"tcp://{self.robot_ip}:{self.gripper_port}")
+            gripper = GripperInterface(
+                ip_address=self.robot_ip, port=self.gripper_port,
+            )
 
             if self.verbose:
-                print(f"[FrankaGripperController] Connected to gripper at {self.robot_ip}:{self.gripper_port}")
+                print(f"[FrankaGripperController] Connected to polymetis Franka Hand "
+                      f"at {self.robot_ip}:{self.gripper_port} (gRPC)")
                 print(f"[FrankaGripperController] Teleop mode: {self.teleop_mode}")
-                print(f"[FrankaGripperController] v2.0: Simplified discrete mode (no interpolation)")
 
-            # Define method names based on server type
-            if self.use_unified_server:
-                get_state_fn = gripper.get_gripper_state
-                goto_fn = gripper.gripper_goto
-                grasp_fn = gripper.gripper_grasp
-            else:
-                get_state_fn = gripper.get_state
-                goto_fn = gripper.goto
-                grasp_fn = gripper.grasp
+            # GripperInterface state has protobuf accessors (.width, .is_moving,
+            # .is_grasped). Wrap into uniform helpers so the rest of the loop
+            # treats them the same regardless of backend.
+            def get_state_fn():
+                st = gripper.get_state()
+                return {
+                    'width': float(st.width),
+                    'is_moving': bool(st.is_moving),
+                    'is_grasped': bool(st.is_grasped),
+                }
+
+            def goto_fn(width: float, speed: float, force: float):
+                gripper.goto(width=float(width), speed=float(speed),
+                             force=float(force), blocking=False)
+
+            def grasp_fn(speed: float, force: float, grasp_width: float):
+                gripper.grasp(speed=float(speed), force=float(force),
+                              grasp_width=float(grasp_width), blocking=False)
 
             # Get initial state
             gripper_state = get_state_fn()
@@ -549,8 +540,9 @@ class FrankaGripperController(mp.Process):
                     overrun_count = 0
 
         except ImportError as e:
-            print(f"[FrankaGripperController] Failed to import zerorpc: {e}")
-            print("[FrankaGripperController] Install with: pip install zerorpc")
+            print(f"[FrankaGripperController] Failed to import polymetis: {e}")
+            print("[FrankaGripperController] Install fairo-polymetis client "
+                  "(should already be present in groot-client env).")
             self.ready_event.set()
         except Exception as e:
             print(f"[FrankaGripperController] Error: {e}")
@@ -559,9 +551,10 @@ class FrankaGripperController(mp.Process):
             self.ready_event.set()
         finally:
             self.ready_event.set()
+            # GripperInterface holds a grpc.Channel; closing is best-effort.
             try:
-                gripper.close()
-            except:
+                gripper.channel.close()
+            except Exception:
                 pass
             if self.verbose:
-                print(f"[FrankaGripperController] Disconnected from gripper")
+                print(f"[FrankaGripperController] Disconnected from polymetis Franka Hand")
