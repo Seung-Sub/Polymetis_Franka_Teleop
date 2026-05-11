@@ -298,18 +298,26 @@ def main(output, robot_ip, robot_port, gripper_port, vive_host, vive_port,
                     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     'bin', 'cv2_viewer.py')
                 try:
+                    # Inherit stdout/stderr from this demo process so the
+                    # viewer's keypress feedback ([cv2_viewer] d/Backspace ...,
+                    # [cv2_viewer] y pressed -> SIGRTMIN ..., unrecognised
+                    # keycode N (...) etc.) lands in the same terminal /
+                    # tee-log as the demo. Previously stdout/stderr were
+                    # captured into a pipe nobody read, so the operator had
+                    # no signal that a key actually fired -- the V-drop
+                    # session at KIST 2026-05-11 surfaced this as
+                    # "d pressed but I don't see anything happen".
                     feh_proc = subprocess.Popen(
                         [sys.executable, viewer_script,
                          VIS_JPEG_PATH,
                          '--signal-pid', str(os.getpid()),
                          '--poll-ms', '30',
-                         '--win-name', 'Franka Vive Demo'],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                         '--win-name', 'Franka Vive Demo'])
                     time.sleep(0.5)
                     if feh_proc.poll() is not None:
-                        err = feh_proc.stderr.read().decode(errors='replace')[:500]
-                        print(f'[vis] viewer exited immediately (rc={feh_proc.returncode}): {err}',
-                              flush=True)
+                        print(f'[vis] viewer exited immediately '
+                              f'(rc={feh_proc.returncode}); check terminal '
+                              f'for traceback above', flush=True)
                         feh_proc = None
                     else:
                         print(f'[vis] cv2 viewer started (PID {feh_proc.pid}, '
