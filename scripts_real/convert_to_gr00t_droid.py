@@ -49,6 +49,15 @@ import zarr
 
 from polymetis_franka_teleop.common.rotation_util import quat_to_rot6d
 
+# ``_conversion_common`` lives next to this script; Python adds the
+# script's directory to sys.path[0] when invoked as
+# ``python scripts_real/<file>.py``, so a same-dir import works without
+# making ``scripts_real`` a package.
+from _conversion_common import (  # noqa: E402  (sibling-script import)
+    classify_cams,
+    load_session,
+)
+
 
 # ============================== Constants ==============================
 
@@ -65,64 +74,9 @@ STATE_DIM = ACTION_DIM = 17
 LOGICAL_VIDEO_KEYS = ("exterior_image_1_left", "wrist_image_left")
 ORIGINAL_VIDEO_KEYS = tuple(f"observation.images.{k}" for k in LOGICAL_VIDEO_KEYS)
 
-# Physical cam -> video-key assignment is determined per-session from the
-# stereo baseline in each ``cam_<i>.json`` (ZED Mini ~63 mm = wrist; ZED 2i
-# ~120 mm = third / exterior).  See ``_classify_cams`` for the threshold.
-# Using a measured intrinsic instead of a hardcoded ``cam_0 = wrist`` keeps
-# the converter correct if the operator reorders ``--camera_serials`` at
-# the demo wrapper level.
-WRIST_BASELINE_MAX_M = 0.08  # ZED Mini ~0.063 m; ZED 2i ~0.120 m
-
 # Placeholder task description for sandbox sessions whose language.json
 # carries ``instruction: null``.  Enabled only with --allow-placeholder.
 PLACEHOLDER_TASK = "perform manipulation task"
-
-
-# ============================== Loading ==============================
-
-
-def load_session(session_dir: Path) -> dict:
-    """Open the session zarr + dataset_meta.json + per-episode language.json."""
-    if not session_dir.is_dir():
-        raise FileNotFoundError(f"session dir not found: {session_dir}")
-    zarr_path = session_dir / "replay_buffer.zarr"
-    root = zarr.open(str(zarr_path), mode="r")
-
-    with open(session_dir / "dataset_meta.json") as f:
-        ds_meta = json.load(f)
-
-    # ``gripper_type`` in dataset_meta.json is the backend short name
-    # ("art" / "franka"); the gripper_convention block keys are the full
-    # backend names ("art_gripper" / "franka_hand"); we translate.
-    gripper_type = ds_meta["gripper_type"]
-    max_width_key = (
-        "art_gripper" if gripper_type == "art"
-        else "franka_hand" if gripper_type == "franka"
-        else f"{gripper_type}_gripper"
-    )
-    max_width = float(ds_meta["gripper_convention"]["max_width_m"][max_width_key])
-
-    episode_ends = np.asarray(root["meta/episode_ends"][:], dtype=np.int64)
-    n_episodes = int(episode_ends.shape[0])
-
-    languages = []
-    for ep in range(n_episodes):
-        lj = session_dir / "videos" / str(ep) / "language.json"
-        if lj.exists():
-            with open(lj) as f:
-                languages.append(json.load(f))
-        else:
-            languages.append({})
-
-    return {
-        "session_dir": session_dir,
-        "root": root,
-        "ds_meta": ds_meta,
-        "max_width": max_width,
-        "episode_ends": episode_ends,
-        "n_episodes": n_episodes,
-        "languages": languages,
-    }
 
 
 # ============================== Per-episode state/action ==============================
@@ -217,50 +171,6 @@ def write_parquet(
     table = pa.Table.from_pandas(df, preserve_index=False)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, out_path)
-
-
-def _classify_cams(session_dir: Path, episode_index: int) -> dict[int, str]:
-    """Map each ``cam_<i>.json`` to its DROID video key by stereo baseline.
-
-    ZED Mini (~63 mm baseline) -> wrist; ZED 2i (~120 mm) -> third / exterior.
-    Threshold ``WRIST_BASELINE_MAX_M`` separates the two; raises if the
-    classification is ambiguous (e.g. two ZED 2i, or two ZED Mini, or any
-    baseline inside the threshold band).
-    """
-    calib_dir = session_dir / "videos" / str(episode_index) / "calibration"
-    cam_files = sorted(calib_dir.glob("cam_*.json"))
-    if len(cam_files) != 2:
-        raise RuntimeError(
-            f"expected 2 cam_<i>.json in {calib_dir}, found {len(cam_files)}: "
-            f"{[p.name for p in cam_files]}"
-        )
-    baselines: dict[int, float] = {}
-    for p in cam_files:
-        with open(p) as fp:
-            calib = json.load(fp)
-        cam_idx = int(p.stem.split("_")[1])
-        baselines[cam_idx] = float(calib["intrinsics"]["baseline_m"])
-
-    wrist_idx    = min(baselines, key=baselines.get)
-    exterior_idx = max(baselines, key=baselines.get)
-    if baselines[wrist_idx] >= WRIST_BASELINE_MAX_M:
-        raise RuntimeError(
-            f"Cannot classify wrist vs exterior cam: both baselines "
-            f">= {WRIST_BASELINE_MAX_M} m ({baselines}). Looks like two "
-            f"ZED 2i (or two of the same model). Add an explicit "
-            f"--wrist-cam-index CLI flag or fix the camera setup."
-        )
-    if baselines[exterior_idx] < WRIST_BASELINE_MAX_M:
-        raise RuntimeError(
-            f"Cannot classify wrist vs exterior cam: both baselines "
-            f"< {WRIST_BASELINE_MAX_M} m ({baselines}). Looks like two "
-            f"ZED Mini. Same fix as above."
-        )
-
-    return {
-        wrist_idx:    "observation.images.wrist_image_left",
-        exterior_idx: "observation.images.exterior_image_1_left",
-    }
 
 
 def symlink_videos(
@@ -462,8 +372,10 @@ def main() -> int:
 
     # Per-session cam classification: which cam_<i> is wrist (ZED Mini) and
     # which is exterior (ZED 2i).  Done once from episode-0 intrinsics --
-    # the physical setup is constant across a session.
-    cam_video_map = _classify_cams(session_dir, episode_index=0)
+    # the physical setup is constant across a session. ``role_naming="lerobot"``
+    # produces ``observation.images.<role>`` keys for the LeRobot v2.1
+    # video tree and info.json features block.
+    cam_video_map = classify_cams(session_dir, episode_index=0, role_naming="lerobot")
     if args.verbose:
         print(f"  cam_video_map = {cam_video_map}", flush=True)
 

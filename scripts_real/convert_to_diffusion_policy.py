@@ -69,61 +69,25 @@ from scipy.spatial.transform import Rotation
 
 from polymetis_franka_teleop.common.rotation_util import quat_to_rot6d
 
+# ``_conversion_common`` lives next to this script; Python adds the
+# script's directory to sys.path[0] when invoked as
+# ``python scripts_real/<file>.py``, so a same-dir import works without
+# making ``scripts_real`` a package.
+from _conversion_common import (  # noqa: E402  (sibling-script import)
+    classify_cams,
+    load_session,
+)
+
 
 # ============================== Constants ==============================
 
 ACTION_DIM = 7   # pos(3) + axis_angle(3) + gripper(1)
 STATE_DIM  = 10  # pos(3) + rot6d(6) + gripper(1)  -- stored in /states for robomimic
 
-# Same baseline-based wrist/exterior split as GR00T converter -- ZED Mini
-# (~63 mm) -> wrist, ZED 2i (~120 mm) -> exterior.
-WRIST_BASELINE_MAX_M = 0.08
-
-# DP-style role names; symlinked under videos/demo_<i>/<role>.mp4.
+# DP-style role names; symlinked under videos/demo_<i>/<role>.mp4. These
+# are the values ``classify_cams(role_naming="plain")`` returns.
 ROLE_WRIST    = "wrist_image_left"
 ROLE_EXTERIOR = "exterior_image_1_left"
-
-
-# ============================== Loading ==============================
-
-
-def load_session(session_dir: Path) -> dict:
-    """Open the session zarr + dataset_meta.json + per-episode language.json."""
-    if not session_dir.is_dir():
-        raise FileNotFoundError(f"session dir not found: {session_dir}")
-    root = zarr.open(str(session_dir / "replay_buffer.zarr"), mode="r")
-    with open(session_dir / "dataset_meta.json") as f:
-        ds_meta = json.load(f)
-
-    gripper_type = ds_meta["gripper_type"]
-    max_width_key = (
-        "art_gripper" if gripper_type == "art"
-        else "franka_hand" if gripper_type == "franka"
-        else f"{gripper_type}_gripper"
-    )
-    max_width = float(ds_meta["gripper_convention"]["max_width_m"][max_width_key])
-
-    episode_ends = np.asarray(root["meta/episode_ends"][:], dtype=np.int64)
-    n_episodes = int(episode_ends.shape[0])
-
-    languages = []
-    for ep in range(n_episodes):
-        lj = session_dir / "videos" / str(ep) / "language.json"
-        if lj.exists():
-            with open(lj) as f:
-                languages.append(json.load(f))
-        else:
-            languages.append({})
-
-    return {
-        "session_dir":  session_dir,
-        "root":         root,
-        "ds_meta":      ds_meta,
-        "max_width":    max_width,
-        "episode_ends": episode_ends,
-        "n_episodes":   n_episodes,
-        "languages":    languages,
-    }
 
 
 # ============================== Per-episode obs / state / action ==============================
@@ -195,38 +159,6 @@ def compute_obs_state_action(
 
 
 # ============================== Cam classification (shared logic) ==============================
-
-
-def _classify_cams(session_dir: Path, episode_index: int = 0) -> dict[int, str]:
-    """ZED Mini (~63 mm) -> wrist, ZED 2i (~120 mm) -> exterior, per session intrinsics."""
-    calib_dir = session_dir / "videos" / str(episode_index) / "calibration"
-    cam_files = sorted(calib_dir.glob("cam_*.json"))
-    if len(cam_files) != 2:
-        raise RuntimeError(
-            f"expected 2 cam_<i>.json in {calib_dir}, found {len(cam_files)}: "
-            f"{[p.name for p in cam_files]}"
-        )
-    baselines: dict[int, float] = {}
-    for p in cam_files:
-        with open(p) as fp:
-            calib = json.load(fp)
-        cam_idx = int(p.stem.split("_")[1])
-        baselines[cam_idx] = float(calib["intrinsics"]["baseline_m"])
-
-    wrist_idx    = min(baselines, key=baselines.get)
-    exterior_idx = max(baselines, key=baselines.get)
-    if baselines[wrist_idx] >= WRIST_BASELINE_MAX_M:
-        raise RuntimeError(
-            f"Cannot classify wrist vs exterior cam: both baselines "
-            f">= {WRIST_BASELINE_MAX_M} m ({baselines})."
-        )
-    if baselines[exterior_idx] < WRIST_BASELINE_MAX_M:
-        raise RuntimeError(
-            f"Cannot classify wrist vs exterior cam: both baselines "
-            f"< {WRIST_BASELINE_MAX_M} m ({baselines})."
-        )
-
-    return {wrist_idx: ROLE_WRIST, exterior_idx: ROLE_EXTERIOR}
 
 
 def symlink_videos(
@@ -320,7 +252,9 @@ def main() -> int:
         print("No episodes to convert.", file=sys.stderr)
         return 1
 
-    cam_video_map = _classify_cams(session_dir, episode_index=0)
+    # ``role_naming="plain"`` returns bare role strings (wrist_image_left,
+    # exterior_image_1_left) suitable for the DP videos/demo_<i>/<role>.mp4 layout.
+    cam_video_map = classify_cams(session_dir, episode_index=0, role_naming="plain")
     if args.verbose:
         print(f"  cam_video_map = {cam_video_map}", flush=True)
 
