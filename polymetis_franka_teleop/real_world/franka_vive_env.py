@@ -476,7 +476,7 @@ class FrankaViveEnv:
         self.start_time = None
 
         # Write recording-time config to the zarr meta. The converters
-        # (convert_to_gr00t_lerobot, convert_franka_vive_to_umi_format) read
+        # (convert_to_gr00t_droid, convert_to_diffusion_policy) read
         # these so the user can't accidentally pass mismatched
         # --gripper_max_width / --fps / --data_format at conversion time.
         self._write_recording_meta()

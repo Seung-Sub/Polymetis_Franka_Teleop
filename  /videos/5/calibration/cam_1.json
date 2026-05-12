@@ -1,0 +1,24 @@
+{
+  "index": 33538770,
+  "model": "SingleZed",
+  "serial": 33538770,
+  "intrinsics": {
+    "fx": 483.0824890136719,
+    "fy": 483.0824890136719,
+    "cx": 343.5068054199219,
+    "cy": 193.45953369140625,
+    "width": 672,
+    "height": 376,
+    "baseline_m": 0.12004487961530685,
+    "distortion_model": "none",
+    "distortion_coeffs": []
+  },
+  "extrinsics": {
+    "measured": false,
+    "position_xyz_m": null,
+    "orientation_quat_xyzw": null
+  },
+  "frame_timestamps_path": "videos/5/cam_1_frame_timestamps.npy",
+  "frame_timestamps_clock": "monotonic, latency-compensated (single_zed calibrated_time)",
+  "frame_timestamps_unit": "seconds"
+}

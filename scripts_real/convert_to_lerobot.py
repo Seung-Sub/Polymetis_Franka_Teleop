@@ -1,12 +1,29 @@
-"""Convert Polymetis_Franka_Teleop data → generic LeRobot v2.1 dataset.
+"""Generic LeRobot v2.1 converter (DEPRECATED for current Batch 2 pipeline).
+
+DEPRECATED: This generic LeRobot converter is not used by the current
+GR00T-DROID / Diffusion Policy pipeline. Use:
+  - scripts_real/convert_to_gr00t_droid.py        for GR00T fine-tuning
+  - scripts_real/convert_to_diffusion_policy.py   for Diffusion Policy training
+
+This file is preserved as a reference implementation for future model
+integrations that consume the generic HuggingFace LeRobot v2.1 format
+(e.g. SmolVLA, ACT via LeRobot, or other HF-LeRobot consumers).
+
+The configurable state_format / gripper_repr options here remain useful
+for adapting to embodiments outside the OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
+convention used by GR00T-DROID.
+
+Original docstring follows.
+=============================================================================
+Convert Polymetis_Franka_Teleop data → generic LeRobot v2.1 dataset.
 
 Targets HuggingFace-LeRobot consumers (ACT, Diffusion Policy via LeRobot,
 SmolVLA, ...). The state/action layout is configurable so the same
 recording can be reshaped for whichever policy you're training.
 
 This converter does NOT bake in the GR00T-DROID 17-D layout (use
-``convert_to_gr00t_lerobot.py`` for that) or the UMI zarr.zip layout
-(use ``convert_franka_vive_to_umi_format.py`` for that).
+``convert_to_gr00t_droid.py`` for that) or the robomimic HDF5 layout
+(use ``convert_to_diffusion_policy.py`` for that).
 
 State / action layouts (selectable via ``--state_format``):
 

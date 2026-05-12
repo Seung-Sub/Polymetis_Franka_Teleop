@@ -186,9 +186,9 @@ The wrapper sets `--data_format`, which determines the ready-pose joints saved a
 
 | `--data_format` | Joints 1–6 | Joint 7 (ART / Franka Hand) | Used by |
 |------|-------|----|----|
-| `groot` | DROID-tilted | 0 / π/4 | `convert_to_gr00t_lerobot.py` |
-| `umi` | Franka home | 0 / π/4 | `convert_to_lerobot.py`, `convert_franka_vive_to_umi_format.py` |
-| `diffusion` | Franka home | 0 / π/4 | `convert_to_lerobot.py`, `convert_franka_vive_to_umi_format.py` |
+| `groot` | DROID-tilted | 0 / π/4 | `convert_to_gr00t_droid.py` |
+| `umi` | Franka home | 0 / π/4 | `convert_to_diffusion_policy.py` (or `convert_to_lerobot.py` for generic HF-LeRobot) |
+| `diffusion` | Franka home | 0 / π/4 | `convert_to_diffusion_policy.py` (or `convert_to_lerobot.py` for generic HF-LeRobot) |
 
 The action representation written into the zarr is the **same** in all three modes (`[eef_pos, eef_aa, gripper_width]`); the difference is purely the joint ready-pose at episode start. Re-record (don't post-hoc convert) if you need to switch ready-pose.
 
@@ -219,12 +219,51 @@ Pick the converter for your model target. All converters read `gripper_max_width
 ### 7.A — GR00T-N1.7-DROID
 
 ```bash
-python scripts_real/convert_to_gr00t_lerobot.py \
-    -i ./data/groot_session \
-    -o ./data/groot_session_gr00t \
-    -t "Pick up the yellow cup and place it in the bowl"
+python scripts_real/convert_to_gr00t_droid.py \
+    --input-session  ./data/groot_session \
+    --output-dataset ./data/groot_session_gr00t \
+    --allow-placeholder   # only for sandbox sessions; production data
+                          # should pass --task at recording time so the
+                          # instruction is already in language.json
 # Output: LeRobot v2.1, 17-D state/action (eef_9d + gripper_position + joint_position)
 # Embodiment tag: OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
+# Tasks read from videos/<ep>/language.json (auto-wired from
+# demo_franka_vive --task) — explicit --task flag at conversion time
+# no longer needed.
+```
+
+### 7.B — Diffusion Policy (robomimic HDF5)
+
+```bash
+python scripts_real/convert_to_diffusion_policy.py \
+    --input-session  ./data/groot_session \
+    --output-dataset ./data/groot_session_dp
+# Output: data/<output>/demos.hdf5 + videos/demo_<i>/<wrist|exterior_image_1>_left.mp4
+# State 10D (pos + rot6d + gripper), Action 7D (pos + axis_angle + gripper).
+# Compatible with diffusion_policy's RobomimicReplayLowdimDataset
+# (abs_action=True, rotation_rep='rotation_6d').
+```
+
+### 7.C — Verification tools (Phase 2-6)
+
+Round-trip regression (run after either converter):
+
+```bash
+python scripts_real/tools/round_trip_test.py \
+    --converter both \
+    --input-session ./data/groot_session
+# Expects 90/90 cells bitwise 0.0e+00 over GR00T (48) + DP (42).
+# Exit code 0 = PASS, 1 = any cell over threshold.
+```
+
+Dataset health check (run on the raw session before conversion):
+
+```bash
+python scripts_real/tools/check_dataset_health.py \
+    --session ./data/groot_session \
+    --strict   # exit 1 on any FAIL — suitable for CI
+# Automates the 8 validation_checks_planned items emitted into
+# dataset_meta.json at recording time.
 ```
 
 The output is directly fine-tunable in Isaac-GR00T:
@@ -239,41 +278,27 @@ uv run python gr00t/experiment/launch_finetune.py \
     --max-steps 5000 --global-batch-size 32
 ```
 
-### 7.B — ACT / HuggingFace LeRobot
+### 7.D — Generic LeRobot v2.1 (DEPRECATED for current Batch 2 pipeline)
+
+`convert_to_lerobot.py` is preserved as a reference implementation for
+future HF-LeRobot consumers (SmolVLA, ACT via LeRobot, ...) but is not
+used by the current GR00T-DROID / DP pipeline (use 7.A / 7.B instead).
+Configurable state_format / gripper_repr still useful for adapting to
+non-DROID embodiments.
 
 ```bash
-# Joint-space (typical for ACT) — 8-D state/action [joint(7), gripper(1)]
-python scripts_real/convert_to_lerobot.py \
-    -i ./data/dp_session -o ./data/dp_session_act \
-    -t "Pick up the yellow cup" \
-    --state_format joint --gripper_repr normalized
-
 # EEF-space — 7-D state/action [eef_pos(3), eef_aa(3), gripper(1)]
 python scripts_real/convert_to_lerobot.py \
-    -i ./data/dp_session -o ./data/dp_session_lerobot_eef \
+    -i ./data/session -o ./data/session_lerobot_eef \
+    -t "Pick up the yellow cup" \
     --state_format eef --gripper_repr width
-
-# Combined — 14-D (joint + eef + gripper) for multi-modal policies
-python scripts_real/convert_to_lerobot.py \
-    -i ./data/dp_session -o ./data/dp_session_lerobot_full \
-    --state_format full --gripper_repr normalized
 ```
 
 | Flag | Choices | Effect |
 |------|---------|--------|
 | `--state_format` | `joint` (8 D) · `eef` (7 D) · `full` (14 D) | State/action layout |
 | `--gripper_repr` | `normalized` (0=open, 1=closed) · `width` (raw m) | Gripper signal repr |
-| `--video_keys` | repeated string | Per-camera key (default `cam_high cam_wrist`; for DP-via-LeRobot pass `camera0_rgb camera1_rgb`) |
-
-### 7.C — Diffusion-Policy / UMI (zarr.zip)
-
-```bash
-python scripts_real/convert_franka_vive_to_umi_format.py \
-    -i ./data/dp_session \
-    -o ./data/dp_session/dataset.zarr.zip \
-    -r 224,224
-# Output: UMI-style zarr.zip, ready for the diffusion-policy training pipeline
-```
+| `--video_keys` | repeated string | Per-camera key (default `cam_high cam_wrist`) |
 
 ---
 
@@ -372,10 +397,11 @@ If anything is stuck, `bin/preflight_full.sh` will detect and (with `AUTO_FIX=1`
 
 | Target | Command |
 |--------|---------|
-| GR00T-DROID | `python scripts_real/convert_to_gr00t_lerobot.py -i <in> -o <out> -t "<task>"` |
-| ACT (joint) | `python scripts_real/convert_to_lerobot.py -i <in> -o <out> -t "<task>" --state_format joint` |
-| LeRobot eef | `python scripts_real/convert_to_lerobot.py -i <in> -o <out> -t "<task>" --state_format eef` |
-| UMI / DP | `python scripts_real/convert_franka_vive_to_umi_format.py -i <in> -o <out>/dataset.zarr.zip -r 224,224` |
+| GR00T-DROID    | `python scripts_real/convert_to_gr00t_droid.py --input-session <in> --output-dataset <out>` |
+| Diffusion Policy | `python scripts_real/convert_to_diffusion_policy.py --input-session <in> --output-dataset <out>` |
+| Round-trip CI  | `python scripts_real/tools/round_trip_test.py --converter both --input-session <in>` |
+| Health check   | `python scripts_real/tools/check_dataset_health.py --session <in>` |
+| Generic LeRobot (deprecated; for HF-LeRobot / SmolVLA) | `python scripts_real/convert_to_lerobot.py -i <in> -o <out> -t "<task>" --state_format eef` |
 
 ### Calibrators
 

@@ -925,7 +925,8 @@ obs_keys:
 ### franka_vive_umi.yaml
 
 ```yaml
-# convert_franka_vive_to_umi_format.py로 변환된 UMI 형식 사용
+# convert_to_diffusion_policy.py로 변환된 robomimic HDF5 형식 사용 (Phase 2-4)
+# (legacy convert_franka_vive_to_umi_format.py 는 제거됨)
 dataset_class: UmiDataset   # 표준 UMI 데이터셋 파이프라인
 image_resolution: [480, 640]
 action_dim: 10              # pos(3) + rotation_6d(6) + gripper(1)

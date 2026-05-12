@@ -67,11 +67,18 @@ You collect once and convert to whichever target format you need.
 
 | Target model | Converter | Output |
 |---|---|---|
-| `nvidia/GR00T-N1.7-3B` / `nvidia/GR00T-N1.7-DROID` | `scripts_real/convert_to_gr00t_lerobot.py` | LeRobot v2.1 with DROID 17-D state/action (eef_9d + gripper + joint) |
-| ACT / HuggingFace LeRobot / generic | `scripts_real/convert_to_lerobot.py` | LeRobot v2.1, raw state/action (`--state_format {joint,eef,full}`) |
-| Diffusion Policy / UMI | `scripts_real/convert_franka_vive_to_umi_format.py` | UMI `dataset.zarr.zip` |
+| `nvidia/GR00T-N1.7-3B` / `nvidia/GR00T-N1.7-DROID` | `scripts_real/convert_to_gr00t_droid.py` | LeRobot v2.1 + GR00T modality.json, DROID 17-D state/action (eef_9d + gripper + joint) |
+| Diffusion Policy | `scripts_real/convert_to_diffusion_policy.py` | robomimic HDF5 (`demos.hdf5`), 7-D action + 10-D state, abs_action-ready |
+| Generic HF-LeRobot / SmolVLA / ACT (deprecated for Batch 2) | `scripts_real/convert_to_lerobot.py` | LeRobot v2.1, configurable state/action (`--state_format {joint,eef,full}`) |
 
-Training itself is out of scope — fine-tune in [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T), HuggingFace LeRobot (ACT), or your `diffusion_policy` checkout, and bring the resulting checkpoint back to `eval_franka_policy.py`.
+Verification & health tools (Phase 2-6):
+
+| Tool | Purpose |
+|---|---|
+| `scripts_real/tools/round_trip_test.py` | V-A round-trip CI gate (GR00T 48 + DP 42 = 90 cells must remain bitwise 0.0e+00) |
+| `scripts_real/tools/check_dataset_health.py` | Automates `validation_checks_planned` from `dataset_meta.json` (obs_native truncation, V-frame, F2-path, F4 dict eq, attrs len, language.json, episode_ends, optional controller log) |
+
+Training itself is out of scope — fine-tune in [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T) or your `diffusion_policy` checkout, and bring the resulting checkpoint back to `eval_franka_policy.py`.
 
 ## Install (one-shot per host)
 
@@ -123,22 +130,25 @@ Mid-session monitoring (separate terminal): `bash bin/monitor_session.sh`.
 
 ```bash
 # GR00T-DROID (15 Hz dataset, DROID 17-D)
-python scripts_real/convert_to_gr00t_lerobot.py \
-    -i ./data/pap -o ./data/pap_gr00t \
-    -t "Pick up the yellow cup"
+python scripts_real/convert_to_gr00t_droid.py \
+    --input-session  ./data/pap \
+    --output-dataset ./data/pap_gr00t
 
-# ACT / generic LeRobot (joint-space, 8-D)
-python scripts_real/convert_to_lerobot.py \
-    -i ./data/pap -o ./data/pap_act \
-    -t "Pick up the yellow cup" \
-    --state_format joint --gripper_repr normalized
+# Diffusion Policy (robomimic HDF5)
+python scripts_real/convert_to_diffusion_policy.py \
+    --input-session  ./data/pap \
+    --output-dataset ./data/pap_dp
 
-# UMI / Diffusion-Policy
-python scripts_real/convert_franka_vive_to_umi_format.py \
-    -i ./data/pap -o ./data/pap/dataset.zarr.zip -r 224,224
+# Regression test (after either converter; CI-friendly exit code)
+python scripts_real/tools/round_trip_test.py \
+    --converter both --input-session ./data/pap
+
+# Health check (run on the raw session before conversion)
+python scripts_real/tools/check_dataset_health.py \
+    --session ./data/pap
 ```
 
-`gripper_max_width`, `fps`, and per-episode tasks are read from `replay_buffer.zarr/meta/.attrs` if present (set during recording), so most flags are optional.
+`gripper_max_width`, `fps`, and per-episode tasks are read from `replay_buffer.zarr/meta/.attrs` if present (set during recording via `--task` flag at demo time), so most flags are optional at conversion time.
 
 ## Latency calibration (run once per hardware change)
 
@@ -216,9 +226,14 @@ Polymetis_Franka_Teleop/
     ├── calibrate_art_gripper_latency.py      ART gripper latency via :50053
     ├── calibrate_zed_latency.py              ZED HW timestamp latency
     ├── calibrate_realsense_latency.py        RealSense HW timestamp latency
-    ├── convert_to_gr00t_lerobot.py           → GR00T DROID embodiment dataset
-    ├── convert_to_lerobot.py                 → generic LeRobot v2 (ACT / HF-LeRobot)
-    └── convert_franka_vive_to_umi_format.py  → UMI / Diffusion-Policy zarr.zip
+    ├── convert_to_gr00t_droid.py             → GR00T-DROID LeRobot v2.1 dataset (Phase 2-1/2-3)
+    ├── convert_to_diffusion_policy.py        → robomimic HDF5 for Diffusion Policy (Phase 2-4)
+    ├── convert_to_lerobot.py                 → generic LeRobot v2 (deprecated; for HF-LeRobot / SmolVLA)
+    ├── _conversion_common.py                 → shared load_session / classify_cams (Phase 2-6)
+    ├── bench_fk_consistency.py               → V-rpc: single-RPC FK vs legacy per-method
+    └── tools/
+        ├── round_trip_test.py                → V-A regression for GR00T + DP (Phase 2-6)
+        └── check_dataset_health.py           → 8-check session health (Phase 2-6)
 ```
 
 ## Sister repositories

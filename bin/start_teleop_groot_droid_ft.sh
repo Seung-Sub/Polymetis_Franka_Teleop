@@ -15,10 +15,16 @@
 # Other defaults mirror start_teleop.sh (ART gripper + 2× ZED + Vive teleop;
 # 60 fps native VGA cameras; --teleop_frequency 100).
 #
-# Output is fully convertible to LeRobot v2 with:
-#   python scripts_real/convert_to_gr00t_lerobot.py \
-#       -i <output_dir> -o <output_dir>_gr00t
+# Output is fully convertible to LeRobot v2.1 (GR00T) with:
+#   python scripts_real/convert_to_gr00t_droid.py \
+#       --input-session  <output_dir> \
+#       --output-dataset <output_dir>_gr00t
 #   # gripper_max_width, fps, episode_tasks all auto-loaded from zarr meta
+#
+# For Diffusion Policy (robomimic HDF5):
+#   python scripts_real/convert_to_diffusion_policy.py \
+#       --input-session  <output_dir> \
+#       --output-dataset <output_dir>_dp
 #
 # Usage:
 #   bash bin/start_teleop_groot_droid_ft.sh <output_dir> [extra demo_franka_vive flags]

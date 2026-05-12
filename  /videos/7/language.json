@@ -1,0 +1,12 @@
+{
+  "episode_id": "cc32404e-415a-4dc8-be44-d41443c5425c",
+  "instruction": null,
+  "task_id": null,
+  "task_id_source": "none",
+  "scene_id": null,
+  "subtask_annotations": null,
+  "timestamp_start_utc": "2026-05-11T12:19:13.286053+00:00",
+  "software_version": "85ba452174e428575754b9b3981045b004eb91cc",
+  "timestamp_end_utc": "2026-05-11T12:20:59.068458+00:00",
+  "success": true
+}

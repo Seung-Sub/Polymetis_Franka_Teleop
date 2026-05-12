@@ -1,0 +1,47 @@
+{
+  "dataset_name": " ",
+  "version": "2.0.0",
+  "schema_version": "2.0.0",
+  "robot_type": "franka_panda",
+  "gripper_type": "art",
+  "frame_conventions": {
+    "ee_pose_frame": "base",
+    "ee_velocity_frame": "flange",
+    "ee_velocity_note": "Computed as J(q) @ qd in pinocchio frame conventions. NOT TCP -- cross-product term to TCP neglected (|omega| x |tx_flange_tip| <= ~22 cm/s at teleop speeds).",
+    "quaternion_order": "[qx, qy, qz, qw]",
+    "quaternion_sign_normalized": true
+  },
+  "gripper_convention": {
+    "signal": "gripper_position",
+    "unit": "meters",
+    "direction": "0 = mechanically closed, max_width = fully open",
+    "max_width_m": {
+      "art_gripper": 0.095,
+      "franka_hand": 0.075
+    },
+    "normalization_for_droid": "normalized = width / max_width  (0=closed, 1=open, matches DROID/spec)"
+  },
+  "control_loop_rate_hz": 100,
+  "state_sample_rate_hz": 100,
+  "camera_fps_target": 60,
+  "main_loop_rate_hz": 15,
+  "data_format_target": "groot",
+  "storage_container": "zarr",
+  "obs_native_layout": "contiguous + episode_ranges (mirrors data/ + episode_ends)",
+  "calibration_method": "none yet (extrinsics placeholder; future apriltag)",
+  "joint_torque_external_source": "polymetis.proto motor_torques_external (field 8); maps to libfranka tau_ext_hat_filtered (community/private API, may change in future polymetis versions)",
+  "action_velocity_cmd_method": "finite_difference",
+  "action_velocity_cmd_dt_s": 0.01,
+  "action_angular_velocity_cmd_space": "axis_angle (rotvec) direct difference; SLERP / quaternion derivative NOT used. Accurate for per-step rotation < 0.5 rad; may show wraparound spikes near pi. Policy mode with sparse action chunks may have additional inaccuracy -- spline derivative deferred to Batch 3.",
+  "validation_checks_planned": [
+    "monotonic timestamp grid (dt == 1/frequency +/- tolerance)",
+    "NaN-free across all zarr arrays",
+    "episode_count == len(episode_tasks) == len(episode_ids) == ... (6 lists)",
+    "language.json existence and instruction == episode_tasks[i] per episode",
+    "cam_<i>_frame_timestamps.npy length == ffprobe frame count for matching mp4",
+    "action_ee_angular_velocity_cmd norm > 10 rad/s frequency < 0.1% per episode (axis-angle wraparound spike detector; 100 Hz x 0.1 rad = 10 rad/s normal upper)",
+    "obs_native_episode_ranges aligns with episode_ends (no orphan rows)",
+    "quaternion sign continuity: max consecutive dot product is >= 0",
+    "obs_native key set matches _NATIVE_ROBOT_KEYS | _NATIVE_GRIPPER_KEYS (no orphan keys; warns if new key added without constant update)"
+  ]
+}
