@@ -46,8 +46,12 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import zarr
+from scipy.spatial.transform import Rotation as R
 
-from polymetis_franka_teleop.common.rotation_util import quat_to_rot6d
+# NOTE (2026-05-13): Switched from polymetis_franka_teleop.common.rotation_util.quat_to_rot6d
+# (Zhou et al. column-major) to NVIDIA's exact DROID convention, so the GR00T-N1.7-DROID
+# prior (post-trained on DROID via download_droid_sample.py) remains useful during fine-tune.
+# See ``scripts/download_droid_sample.py`` in Isaac-GR00T upstream for the reference.
 
 # ``_conversion_common`` lives next to this script; Python adds the
 # script's directory to sys.path[0] when invoked as
@@ -57,6 +61,42 @@ from _conversion_common import (  # noqa: E402  (sibling-script import)
     classify_cams,
     load_session,
 )
+
+
+# ============================== NVIDIA DROID convention ==============================
+# Reference: Isaac-GR00T/scripts/download_droid_sample.py:euler_to_rot6d
+#
+# The OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT embodiment was trained on rot6d
+# computed as:
+#     rot_matrices @ DROID_EEF_ROTATION_CORRECT      # frame correction
+#     rot6d = rot_matrices[:, :2, :].reshape(-1, 6)  # row-major first 2 rows
+# Empirically confirmed against NVIDIA's demo_data/droid_sample (bitwise match
+# on frame 0).  Using a different convention loses the DROID prior.
+DROID_EEF_ROTATION_CORRECT = np.array(
+    [[0, 0, -1], [-1, 0, 0], [0, 1, 0]],
+    dtype=np.float64,
+)
+
+
+def quat_to_eef_rot6d_droid(quat: np.ndarray) -> np.ndarray:
+    """Quaternion ``[qx,qy,qz,qw]`` -> DROID-convention 6D rotation.
+
+    Implementation matches Isaac-GR00T/scripts/download_droid_sample.py
+    exactly: ``R @ DROID_EEF_ROTATION_CORRECT`` then take the first two rows
+    in row-major order ``[m00, m01, m02, m10, m11, m12]``.
+
+    Args:
+        quat: ``(4,)`` or ``(N, 4)`` quaternion array, scalar-last.
+
+    Returns:
+        ``(6,)`` or ``(N, 6)`` rot6d array.
+    """
+    q = np.asarray(quat, dtype=np.float64)
+    rot_mat = R.from_quat(q).as_matrix()              # (..., 3, 3)
+    rot_mat = rot_mat @ DROID_EEF_ROTATION_CORRECT    # frame correction
+    if rot_mat.ndim == 2:
+        return rot_mat[:2, :].reshape(6)              # row-major first 2 rows
+    return rot_mat[..., :2, :].reshape(*rot_mat.shape[:-2], 6)
 
 
 # ============================== Constants ==============================
@@ -90,16 +130,20 @@ def compute_state_action(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Slice one episode and assemble its (N, 17) state + action arrays.
 
+    Layout follows NVIDIA's DROID convention so the GR00T-N1.7-DROID prior
+    (trained on data produced by ``scripts/download_droid_sample.py``) is
+    preserved during fine-tune.
+
     state[t]:
       [0:3]   robot0_eef_pos[t]                                       (TCP frame, m)
-      [3:9]   rot6d(robot0_eef_orientation_quat[t])                   (Zhou et al. 6D)
-      [9]     robot0_gripper_width[t] / max_width                     (normalized)
+      [3:9]   rot6d_droid(robot0_eef_orientation_quat[t])             (row-major + DROID corrective)
+      [9]     1 - robot0_gripper_width[t] / max_width                 (DROID: 1=close, 0=open)
       [10:17] robot0_joint_pos[t]                                     (rad)
 
     action[t]:
       [0:3]   action_ee_position_cmd[t]                               (operator cmd)
-      [3:9]   rot6d(action_ee_orientation_quat_cmd[t])
-      [9]     robot0_gripper_width[min(t+1, N-1)] / max_width         (next-step state proxy)
+      [3:9]   rot6d_droid(action_ee_orientation_quat_cmd[t])
+      [9]     1 - robot0_gripper_width[min(t+1, N-1)] / max_width     (next-step state proxy, DROID convention)
       [10:17] action_joint_position_cmd[t]
     """
     s = slice(ep_start, ep_end)
@@ -115,14 +159,16 @@ def compute_state_action(
     if n == 0:
         raise ValueError(f"empty episode slice [{ep_start}:{ep_end}]")
 
-    rot6d_state  = quat_to_rot6d(eef_quat)
-    rot6d_action = quat_to_rot6d(cmd_quat)
+    rot6d_state  = quat_to_eef_rot6d_droid(eef_quat)
+    rot6d_action = quat_to_eef_rot6d_droid(cmd_quat)
 
     # ---- state ----
     state = np.zeros((n, STATE_DIM), dtype=np.float32)
     state[:, 0:3]   = eef_pos
     state[:, 3:9]   = rot6d_state
-    state[:, 9]     = g_width / max_width
+    # DROID convention: 1=close, 0=open.  Our raw width is 0=close, max=open,
+    # so we invert here to match.
+    state[:, 9]     = 1.0 - (g_width / max_width)
     state[:, 10:17] = joint_pos
 
     # ---- action gripper: t+1 state with last-frame clamp ----
@@ -134,7 +180,7 @@ def compute_state_action(
     action = np.zeros((n, ACTION_DIM), dtype=np.float32)
     action[:, 0:3]   = cmd_pos
     action[:, 3:9]   = rot6d_action
-    action[:, 9]     = g_next / max_width
+    action[:, 9]     = 1.0 - (g_next / max_width)   # DROID convention: 1=close
     action[:, 10:17] = cmd_jpos
     return state, action
 

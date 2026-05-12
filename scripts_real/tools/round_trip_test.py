@@ -42,7 +42,23 @@ import pandas as pd
 import zarr
 from scipy.spatial.transform import Rotation
 
-from polymetis_franka_teleop.common.rotation_util import quat_to_rot6d
+from polymetis_franka_teleop.common.rotation_util import quat_to_rot6d  # used by DP path
+
+# DROID convention used by convert_to_gr00t_droid.py (matches NVIDIA's
+# scripts/download_droid_sample.py).  Keep these two in lock-step.
+_DROID_EEF_ROTATION_CORRECT = np.array(
+    [[0, 0, -1], [-1, 0, 0], [0, 1, 0]],
+    dtype=np.float64,
+)
+
+
+def _quat_to_eef_rot6d_droid(quat: np.ndarray) -> np.ndarray:
+    """Mirror convert_to_gr00t_droid.quat_to_eef_rot6d_droid for round-trip."""
+    q = np.asarray(quat, dtype=np.float64)
+    rot_mat = Rotation.from_quat(q).as_matrix() @ _DROID_EEF_ROTATION_CORRECT
+    if rot_mat.ndim == 2:
+        return rot_mat[:2, :].reshape(6)
+    return rot_mat[..., :2, :].reshape(*rot_mat.shape[:-2], 6)
 
 
 _GR00T_SLOTS = (
@@ -82,8 +98,8 @@ def _gr00t_matrix(
 
         exp_state = np.zeros((n, 17), dtype=np.float32)
         exp_state[:, 0:3]   = eef_pos
-        exp_state[:, 3:9]   = quat_to_rot6d(eef_quat)
-        exp_state[:, 9]     = g_width / max_width
+        exp_state[:, 3:9]   = _quat_to_eef_rot6d_droid(eef_quat)
+        exp_state[:, 9]     = 1.0 - (g_width / max_width)   # DROID: 1=close
         exp_state[:, 10:17] = joint_pos
 
         g_next = g_width.copy()
@@ -91,8 +107,8 @@ def _gr00t_matrix(
             g_next[:-1] = g_width[1:]
         exp_action = np.zeros((n, 17), dtype=np.float32)
         exp_action[:, 0:3]   = cmd_pos
-        exp_action[:, 3:9]   = quat_to_rot6d(cmd_quat)
-        exp_action[:, 9]     = g_next / max_width
+        exp_action[:, 3:9]   = _quat_to_eef_rot6d_droid(cmd_quat)
+        exp_action[:, 9]     = 1.0 - (g_next / max_width)   # DROID: 1=close
         exp_action[:, 10:17] = cmd_jpos
 
         parquet = dataset_dir / "data" / "chunk-000" / f"episode_{ep:06d}.parquet"
