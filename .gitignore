@@ -5,6 +5,13 @@ calibration_results/
 *.zarr.zip
 *.mp4
 
+# Stray junk: if a shell command substitution like ``data/session_$(date ...)``
+# evaluates to an empty timestamp (broken paste / mangled line continuation),
+# the demo can land its output at the repo root with a literal-space name.
+# Match any top-level path starting with whitespace so the next accident
+# doesn't get committed by a hurried ``git add -A``.
+/ *
+
 # Python build/install
 __pycache__/
 *.py[cod]
