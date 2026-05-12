@@ -250,37 +250,22 @@ else
 fi
 
 # ---------- 5. NUC polymetis arm ----------
+# Policy: the NUC arm is owned by the operator -- preflight NEVER auto-
+# starts it.  An earlier version did, which caused phantom arm processes
+# the operator didn't request and obscured Franka Desk e-stop / FCI state.
+# Now we diagnose only and print the exact command to run on the NUC.
 echo
 echo "[5/6] NUC polymetis arm (192.168.1.12:50051)..."
-if ! command -v sshpass >/dev/null 2>&1; then
-    warn "sshpass not installed -- cannot auto-bring-up NUC. Manual: ssh kist@$NUC_HOST 'sudo bash /usr/local/sbin/start_franka_arm.sh'"
-elif ! ping -c 1 -W 2 "$NUC_HOST" >/dev/null 2>&1; then
-    fail "NUC $NUC_HOST not pingable -- check network"
+if ! ping -c 1 -W 2 "$NUC_HOST" >/dev/null 2>&1; then
+    fail "NUC $NUC_HOST not pingable -- check network / NUC power / LAN cable"
     FAULTS=$((FAULTS+1))
 elif ! nc -z -w 2 "$NUC_HOST" 50051 2>/dev/null; then
-    if [[ "$AUTO_FIX" == "yes" ]]; then
-        fix "NUC :50051 down -- starting polymetis arm via SSH"
-        sshpass -p "$NUC_PWD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-            "$NUC_USER@$NUC_HOST" \
-            "echo $NUC_PWD | sudo -S bash -c 'nohup setsid bash /usr/local/sbin/start_franka_arm.sh > /tmp/franka_arm.log 2>&1 < /dev/null & ' ; echo dispatched" \
-            >/tmp/preflight_nuc.log 2>&1
-        # Wait up to 15 s for polymetis to come up
-        for _ in $(seq 1 15); do
-            sleep 1
-            if nc -z -w 1 "$NUC_HOST" 50051 2>/dev/null; then
-                ok "NUC polymetis :50051 reachable (auto-started)"
-                break
-            fi
-        done
-        if ! nc -z -w 2 "$NUC_HOST" 50051 2>/dev/null; then
-            fail "NUC polymetis still down after 15 s -- ssh manually: ssh kist@$NUC_HOST 'sudo bash /usr/local/sbin/start_franka_arm.sh'"
-            fail "  -> check NUC log: ssh kist@$NUC_HOST 'tail /tmp/franka_arm.log'"
-            FAULTS=$((FAULTS+1))
-        fi
-    else
-        fail "NUC :50051 down (AUTO_FIX=no)"
-        FAULTS=$((FAULTS+1))
-    fi
+    fail "NUC :50051 down -- start the arm manually on the NUC:"
+    fail "    ssh kist@$NUC_HOST"
+    fail "    sudo bash /usr/local/sbin/start_franka_arm.sh"
+    fail "  Don't forget Franka Desk (https://172.16.0.2/desk/):"
+    fail "    unlock joints + FCI Activate + verify external e-stop released."
+    FAULTS=$((FAULTS+1))
 else
     ok "NUC polymetis :50051 reachable"
 fi

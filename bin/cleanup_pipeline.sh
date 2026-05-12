@@ -16,9 +16,14 @@
 # Policy
 # ------
 # * Kill orphan client-side processes aggressively (we control them all).
-# * Restart a service only if it is **down** (systemd inactive / port
-#   unreachable).  Don't touch healthy services -- the goal is to fix what
-#   is broken, not to disrupt what is already working.
+# * Restart pro4000-LOCAL systemd services (ethercat, art-gripper-daemon)
+#   only if they are **down**.  These are local and idempotent to start.
+# * NUC polymetis arm is **NEVER auto-started** by this script.  The operator
+#   starts the arm manually on the NUC at session start, and uses Franka Desk
+#   to unlock joints + FCI Activate.  This avoids surprise-running the arm
+#   in the background, and keeps physical/cyber control of the arm explicit.
+#   If :50051 is up while running cleanup, we leave NUC alone entirely;
+#   if down, we just report the manual command the operator should run.
 # * Hardware-level issues (USB unplugged, SteamVR not launched) cannot be
 #   auto-fixed; report them precisely so the operator can act.
 # * Refuse to run if a demo / eval is already running locally on pro4000
@@ -27,12 +32,16 @@
 #
 # Flags
 # -----
-#   --no-nuc                 skip the NUC SSH section (offline / no LAN to NUC)
+#   --no-nuc                 skip the NUC SSH section entirely
 #   --no-gripper-restart     skip auto-restart of art_gripper_daemon
-#   --no-arm-restart         skip auto-restart of NUC polymetis arm
 #   --force                  proceed even if a session is currently running
 #                            (only when you really mean it)
 #   --quiet                  suppress section banners (still prints findings)
+#
+# Deprecated flags (still accepted, no-op)
+# ----------------------------------------
+#   --no-arm-restart         NUC arm is no longer auto-restarted by default;
+#                            this flag is now redundant.
 
 set +e
 
@@ -50,7 +59,7 @@ for arg in "$@"; do
     case "$arg" in
         --no-nuc)              SKIP_NUC=1 ;;
         --no-gripper-restart)  SKIP_GRIPPER_RESTART=1 ;;
-        --no-arm-restart)      SKIP_ARM_RESTART=1 ;;
+        --no-arm-restart)      : ;;   # deprecated no-op (NUC arm is never auto-restarted)
         --force)               FORCE=1 ;;
         --quiet)               QUIET=1 ;;
         -h|--help)
@@ -211,71 +220,41 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────
-# 6. NUC (Franka arm via polymetis :50051)
+# 6. NUC polymetis arm (Franka) -- DIAGNOSE ONLY
 # ──────────────────────────────────────────────────────────────────────
-section "6. NUC polymetis arm (Franka)"
+# Policy: the NUC arm is owned by the operator.  This script never starts
+# or restarts it -- doing so previously caused "phantom" arm processes the
+# operator didn't ask for (sub bug: a brief :50051 outage during cleanup
+# was misread as "arm down, please restart").  Instead we just report
+# current state, and tell the operator exactly what to type on the NUC if
+# they need to bring the arm up.
+section "6. NUC polymetis arm (Franka) -- diagnostic only"
 
 if [ "$SKIP_NUC" = "1" ]; then
     note "--no-nuc passed -- skipped"
 elif ! port_alive 192.168.1.12 22 2; then
     warn "NUC SSH (port 22) NOT reachable -- check NUC power / LAN cable"
 else
-    # Choose SSH prefix once (used by both orphan-kill and restart paths).
-    if command -v sshpass >/dev/null 2>&1; then
-        SSH_PFX="sshpass -p $NUC_PASS ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5"
-    else
-        SSH_PFX="ssh -o ConnectTimeout=5"
-    fi
-
-    # First check :50051 directly from pro4000.
     if port_alive 192.168.1.12 50051 2; then
-        ok "polymetis :50051 reachable -- NOT touching NUC processes (would tear down a healthy server)"
-    else
-        warn "polymetis :50051 NOT reachable -- cleaning NUC orphans then restarting"
-
-        # Step 1: kill any orphaned polymetis processes left over from a crashed
-        # previous run.  Only safe to do this when :50051 is already down -- the
-        # patterns include launch_robot.py and run_server which ARE the live
-        # arm server when it's healthy.
-        $SSH_PFX "$NUC_HOST" "bash -s" <<'NUC_EOF' 2>&1 | sed 's/^/    /'
-PASS="kist"
-killed=0
-for pat in fairo/polymetis/polymetis/build/run_server franka_panda_client franka_hand_client launch_robot.py launch_gripper.py ; do
-    pids=$(pgrep -f "$pat" 2>/dev/null)
-    [ -n "$pids" ] || continue
-    echo "$PASS" | sudo -S kill $pids 2>/dev/null
-    killed=$((killed + 1))
-done
-sleep 1
-for pat in fairo/polymetis/polymetis/build/run_server franka_panda_client franka_hand_client launch_robot.py launch_gripper.py ; do
-    pids=$(pgrep -f "$pat" 2>/dev/null)
-    [ -n "$pids" ] || continue
-    echo "$PASS" | sudo -S kill -9 $pids 2>/dev/null
-done
-echo "  NUC orphans cleared: $killed pattern(s)"
-NUC_EOF
-
-        # Step 2: restart the arm server (unless caller suppressed it).
-        # start_franka_arm.sh runs the arm server in the foreground forever,
-        # so we MUST detach it on the NUC (nohup + & + redirect all fds) and
-        # let SSH return immediately.  Without this the cleanup script hangs.
-        if [ "$SKIP_ARM_RESTART" = "1" ]; then
-            warn "  (--no-arm-restart was passed -- skipping restart)"
+        ok "polymetis :50051 reachable (arm server running on NUC)"
+        # Surface what's running so the operator knows the source.
+        if command -v sshpass >/dev/null 2>&1; then
+            SSH_PFX="sshpass -p $NUC_PASS ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no"
         else
-            note "launching start_franka_arm.sh on NUC (detached, log -> /tmp/franka_arm.log)"
-            $SSH_PFX "$NUC_HOST" \
-                "echo $NUC_PASS | sudo -S nohup bash /usr/local/sbin/start_franka_arm.sh </dev/null >/tmp/franka_arm.log 2>&1 &" \
-                2>&1 | sed 's/^/    /'
-            # Poll up to ~30 s for :50051 to come up (arm init + libfranka handshake takes ~5-8 s).
-            for i in 1 2 3 4 5 6; do
-                sleep 5
-                if port_alive 192.168.1.12 50051 2; then
-                    ok "polymetis :50051 now reachable -- arm server up (after ${i}x5 s)"
-                    break
-                fi
-                [ "$i" = "6" ] && warn "polymetis :50051 still down after 30 s -- check NUC: 'tail /tmp/franka_arm.log; sudo bash /usr/local/sbin/start_franka_arm.sh'"
-            done
+            SSH_PFX="ssh -o ConnectTimeout=5 -o BatchMode=yes"
         fi
+        $SSH_PFX "$NUC_HOST" \
+            "pgrep -af 'start_franka_arm|launch_robot.py|fairo/polymetis/polymetis/build/run_server' 2>/dev/null | head -5" \
+            2>/dev/null | sed 's/^/    /'
+    else
+        warn "polymetis :50051 NOT reachable on NUC"
+        warn "  Manual action on NUC (one of):"
+        warn "    1) Foreground (Ctrl+C to stop, recommended for sessions):"
+        warn "         ssh kist@192.168.1.12"
+        warn "         sudo bash /usr/local/sbin/start_franka_arm.sh"
+        warn "    2) Auto-quit on session end (detached, logs to /tmp/franka_arm.log):"
+        warn "         ssh kist@192.168.1.12 'sudo -S nohup bash /usr/local/sbin/start_franka_arm.sh </dev/null >/tmp/franka_arm.log 2>&1 &'"
+        warn "  Don't forget Franka Desk: unlock joints + FCI Activate."
     fi
 fi
 

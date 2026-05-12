@@ -65,19 +65,21 @@ bash ~/Polymetis_Franka_Teleop/bin/cleanup_pipeline.sh
 | 3 | ZED SDK 락 | `/tmp/.zed*`, `/tmp/zed_*`, `/dev/shm/zed_*`, `/var/lib/zed/.cam_lock_*` 제거 |
 | 4 | cv2_viewer 임시 JPG | `/tmp/teleop_vis*.jpg`, `/tmp/franka_vive_*.jpg` 제거 |
 | 5 | ART gripper + ethercat | systemd inactive면 `sudo systemctl restart` 후 `:50053` 재확인 |
-| 6 | NUC polymetis `:50051` | down이면 → NUC orphan kill (`run_server`, `launch_robot.py`) → `nohup sudo bash /usr/local/sbin/start_franka_arm.sh &` (detached) → 30 s까지 poll |
+| 6 | NUC polymetis `:50051` | **진단만** (절대 자동 재시작 안 함). UP이면 NUC 프로세스 리스트 보고, DOWN이면 사용자가 직접 켜야 할 명령 출력. |
 | 7 | 카메라 USB 가시성 | `lsusb` + `rs-enumerate-devices` + `/dev/video*` holder 리포트 |
 | 8 | Vive `:12345` | `vrserver` alive 여부만 보고 (수동 액션 안내) |
 | 9 | 요약 | 모두 OK면 `Pipeline READY` (exit 0), 아니면 exit 1 |
 
 **Flags:**
 - `--no-nuc`: NUC SSH 섹션 통째로 skip (LAN 끊겼을 때)
-- `--no-arm-restart`: NUC `:50051` 자동 재시작 skip (down이라도 진단만)
 - `--no-gripper-restart`: art-gripper-daemon 자동 재시작 skip
 - `--force`: active session 있어도 강제 진행
 - `--quiet`: section 배너 숨김
+- (deprecated) `--no-arm-restart`: 무의미한 no-op. NUC arm은 더 이상 자동 재시작 안 함
 
-**예상 시간**: 정상 상태 ~2 s, NUC arm 재시작 필요시 ~30-40 s.
+**예상 시간**: 항상 ~2 s. NUC arm 자동 재시작이 없으므로 cleanup은 빠르게 끝남.
+
+> **2026-05-12 정책 변경**: NUC arm은 **운영자가 직접 켜야** 합니다. 이전엔 cleanup이 자동으로 `nohup start_franka_arm.sh &`를 띄웠는데, 사용자가 의도하지 않은 백그라운드 arm 프로세스가 남는 사고가 있어 정책을 바꿨습니다. cleanup은 진단만, 시작은 사용자가.
 
 > 이전 버전 `cleanup_pro4000.sh` (commit f478d7d)는 service 재시작 없이 local cleanup만. 보수적 진단용으로 남겨둠.
 
@@ -88,20 +90,32 @@ bash ~/Polymetis_Franka_Teleop/bin/cleanup_pipeline.sh
 2. FCI **Activate**
 3. 외부 e-stop 해제 확인
 
-> NUC 또는 같은 LAN 내 PC에서 접속 가능. cleanup_pipeline이 NUC arm을 띄우려면 FCI가 먼저 Activate 돼있어야 함.
+> NUC 또는 같은 LAN 내 PC에서 접속 가능. **§2.3에서 NUC arm을 띄우기 전에** FCI Activate 먼저.
 
-### 2.3 NUC arm 서버 — cleanup_pipeline이 이미 처리
+### 2.3 NUC arm 서버 — **운영자가 직접 시작** (필수)
 
-`§2.1`에서 `:50051` UP이면 추가 작업 없음. 만약 cleanup_pipeline이 `polymetis :50051 still down`을 출력했다면:
+cleanup이 끝났으면 NUC에서 arm 서버를 직접 시작합니다.
 
 ```bash
-# NUC 모니터에서 직접 (또는 ssh kist@192.168.1.12):
+# 옵션 A — NUC 모니터/키보드 직접 (권장: 세션 종료 시 Ctrl+C로 깔끔하게 종료 가능)
 sudo bash /usr/local/sbin/start_franka_arm.sh
-# 다음 두 줄이 나오면 OK:
-#   [INFO] Connected.
-#   [arm pinner] cores 6,7 핀 적용 완료
-# → 이 터미널 그대로 둠 (Ctrl+C ❌)
 ```
+
+```bash
+# 옵션 B — pro4000에서 SSH로 (백그라운드 detach, log → /tmp/franka_arm.log)
+ssh kist@192.168.1.12 'sudo -S nohup bash /usr/local/sbin/start_franka_arm.sh </dev/null >/tmp/franka_arm.log 2>&1 &'
+# 종료 시: ssh kist@192.168.1.12 "sudo pkill -f start_franka_arm; sudo pkill -f launch_robot.py; sudo pkill -f run_server"
+```
+
+성공 신호 (옵션 A의 경우 stdout에 직접, 옵션 B의 경우 `/tmp/franka_arm.log`에):
+```
+[INFO] Connected.
+[arm pinner] cores 6,7 핀 적용 완료
+```
+
+> ⚠️ **옵션 A 사용 시 그 터미널은 그대로 두세요 (Ctrl+C 누르면 arm 죽음).** 데이터 수집이 모두 끝난 뒤에 Ctrl+C로 닫으면 됩니다.
+>
+> ⚠️ **옵션 B 사용 시 데이터 수집 끝나면 종료 명령을 잊지 마세요** — 백그라운드 arm이 계속 살아있는 게 위 사고의 원인이었습니다.
 
 ### 2.4 Vive stack bring-up
 
@@ -131,18 +145,18 @@ bash ~/Polymetis_Franka_Teleop/bin/start_vive_stack.sh restart  # 재시작
 bash ~/Polymetis_Franka_Teleop/bin/preflight_full.sh
 ```
 
-6 phase 자동 점검 + AUTO_FIX:
-1. 잔존 Python 프로세스
-2. ART daemon TCP OP_PING (단순 systemd 상태가 아니라 실제 응답까지 확인)
+6 phase 자동 점검:
+1. 잔존 Python 프로세스 (AUTO_FIX 가능)
+2. ART daemon TCP OP_PING (단순 systemd 상태가 아니라 실제 응답까지 확인, AUTO_FIX 가능)
 3. ZED 4/4 USB + pyzed가 2개를 잡는지
-4. Vive `vrserver` + `vive_input` Summary에 controllers ≥ 1
-5. NUC `:50051` TCP 연결
+4. Vive `vrserver` + `vive_input` Summary에 controllers ≥ 1 (AUTO_FIX 가능)
+5. NUC `:50051` TCP 연결 — **DOWN이면 FAIL 후 안내** (자동 재시작 ❌; §2.3에서 사용자가 직접 켜야 함)
 6. `ulimit -r ≥ 50` + `franka-client-rt-tune` service
 
 마지막에 `All checks passed -- ready to launch demo.` 가 나오면 데이터 수집 시작 가능.
 
 **환경 변수**:
-- `AUTO_FIX=no` → 진단만, 자동 복구 안 함
+- `AUTO_FIX=no` → 진단만, 자동 복구 안 함 (단 NUC arm은 어떤 모드에서도 자동 시작 안 함 — 항상 §2.3로 운영자가 직접)
 - `NUC_USER/HOST/PWD` → NUC SSH 정보 override
 
 ---
@@ -482,13 +496,15 @@ GR00T는 별도 inference server 띄우고 (위 §5.4) DROID 클라이언트가 
 ```bash
 # pro4000 데모 터미널: q 두 번 (자연 종료)
 # 혹시 잔존이 있으면:
-bash ~/Polymetis_Franka_Teleop/bin/cleanup_pipeline.sh --no-arm-restart --no-gripper-restart
+bash ~/Polymetis_Franka_Teleop/bin/cleanup_pipeline.sh --no-gripper-restart
 
 # Vive stack 내림 (다음 세션이 한참 후일 때):
 bash ~/Polymetis_Franka_Teleop/bin/start_vive_stack.sh stop
 
-# NUC arm 그대로 두기 — 다음 세션을 위해 살려둠
-# 끄려면 NUC 터미널에서 Ctrl+C (start_franka_arm.sh)
+# NUC arm 종료 (다음 세션이 가까우면 살려두기, 한참 후면 반드시 끄기)
+#   옵션 A (NUC 직접 켰을 때): NUC 터미널에서 Ctrl+C
+#   옵션 B (SSH 백그라운드로 켰을 때): pro4000에서
+ssh kist@192.168.1.12 "sudo pkill -f start_franka_arm; sudo pkill -f launch_robot.py; sudo pkill -f run_server"
 ```
 
 ---
@@ -520,7 +536,8 @@ bash ~/Polymetis_Franka_Teleop/bin/start_vive_stack.sh stop
 
 | 증상 | 원인 | 조치 |
 |---|---|---|
-| `:50051 unreachable` | polymetis 죽음 | `cleanup_pipeline.sh` sect 6 자동 재시작 (orphan kill + nohup start_franka_arm.sh). 그래도 안 되면 NUC SSH 직접 |
+| `:50051 unreachable` | polymetis 안 켜져있음 (수동으로 켜야 함) | **사용자가 NUC에서 직접 시작** — §2.3 옵션 A/B 참고. `cleanup_pipeline.sh`는 진단만 함 (자동 시작 정책상 비활성, 2026-05-12 변경). |
+| NUC arm이 본인 모르게 떠있음 | 이전 cleanup이 자동 재시작 (구버전) 또는 옵션 B 종료 깜박함 | `ssh kist@192.168.1.12 "sudo pkill -f start_franka_arm; sudo pkill -f launch_robot.py; sudo pkill -f run_server"` 로 정리. 새 버전 cleanup은 자동 재시작 안 함 |
 | `Connecting to Franka Emika ...` 에서 멈춤 | FCI 비활성 또는 e-stop | Franka Desk 다시 → unlock + FCI Activate |
 | `Recovery #N` 자주 발생 | velocity clamp 너무 작거나 collision 빈번 | `--tuning_preset gentle` / `--max_pos_velocity` 낮추기. `docs/teleop_tuning.md` |
 | `IK STUCK` count > 0 | 워크스페이스 한계 도달 | Vive grip을 잠시 떼고 robot이 자연스러운 자세로 복귀하게 둠 |
