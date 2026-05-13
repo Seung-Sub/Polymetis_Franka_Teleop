@@ -31,6 +31,14 @@ POLICY_PORT="${POLICY_PORT:-5555}"
 ROOT="${HOME}/Isaac-GR00T"  # repo path on pro4000
 cd "$ROOT"
 
+# Sync our authoritative franka_env_kist.py into the GR00T examples tree
+KIST_ENV_SRC="$HOME/Polymetis_Franka_Teleop/examples/DROID/franka_env_kist.py"
+KIST_ENV_DST="$HOME/Isaac-GR00T/examples/DROID/franka_env_kist.py"
+if [ -f "$KIST_ENV_SRC" ]; then
+    cp "$KIST_ENV_SRC" "$KIST_ENV_DST"
+    echo "[deploy] synced franka_env_kist.py ($(stat -c "%Y" "$KIST_ENV_SRC")) to Isaac-GR00T/examples/DROID/"
+fi
+
 source "${HOME}/anaconda3/etc/profile.d/conda.sh"
 conda activate groot-client
 
