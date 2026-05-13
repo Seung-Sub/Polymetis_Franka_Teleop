@@ -235,25 +235,50 @@ if [ "$SKIP_NUC" = "1" ]; then
 elif ! port_alive 192.168.1.12 22 2; then
     warn "NUC SSH (port 22) NOT reachable -- check NUC power / LAN cable"
 else
-    if port_alive 192.168.1.12 50051 2; then
-        ok "polymetis :50051 reachable (arm server running on NUC)"
-        # Surface what's running so the operator knows the source.
-        if command -v sshpass >/dev/null 2>&1; then
-            SSH_PFX="sshpass -p $NUC_PASS ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no"
-        else
-            SSH_PFX="ssh -o ConnectTimeout=5 -o BatchMode=yes"
-        fi
+    # Choose SSH prefix
+    if command -v sshpass >/dev/null 2>&1; then
+        SSH_PFX="sshpass -p $NUC_PASS ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no"
+    else
+        SSH_PFX="ssh -o ConnectTimeout=5 -o BatchMode=yes"
+    fi
+
+    port_open=0
+    port_alive 192.168.1.12 50051 2 && port_open=1
+
+    # Process inventory on NUC (always check, regardless of port state).
+    proc_count=$($SSH_PFX "$NUC_HOST" \
+        "pgrep -f 'fairo/polymetis/polymetis/build/run_server|launch_robot.py' 2>/dev/null | wc -l" \
+        2>/dev/null | tr -d '[:space:]')
+    proc_count=${proc_count:-0}
+
+    if [ "$port_open" = "1" ] && [ "$proc_count" -gt 0 ]; then
+        # Port + process both alive — healthy.
+        ok "polymetis :50051 reachable + $proc_count NUC process(es) running"
         $SSH_PFX "$NUC_HOST" \
             "pgrep -af 'start_franka_arm|launch_robot.py|fairo/polymetis/polymetis/build/run_server' 2>/dev/null | head -5" \
             2>/dev/null | sed 's/^/    /'
+    elif [ "$port_open" = "1" ] && [ "$proc_count" = "0" ]; then
+        # Port bound but no process — ZOMBIE state (Ctrl+C left lingering socket).
+        warn "polymetis :50051 PORT BOUND but no polymetis process found on NUC"
+        warn "  -> zombie socket from a prior Ctrl+C.  Next start_franka_arm.sh will fail with:"
+        warn "        AssertionError: Port unavailable; possibly another server found..."
+        warn ""
+        warn "  Fix: clean up NUC with the bundled helper, then relaunch:"
+        warn "       ssh kist@192.168.1.12"
+        warn "       sudo bash /usr/local/sbin/cleanup_polymetis.sh"
+        warn "       sudo bash /usr/local/sbin/start_franka_arm.sh"
+    elif [ "$port_open" = "0" ] && [ "$proc_count" -gt 0 ]; then
+        # No port but processes alive — half-dead state.
+        warn "polymetis :50051 NOT reachable but $proc_count NUC process(es) still alive"
+        warn "  -> partially crashed.  Clean up first:"
+        warn "       ssh kist@192.168.1.12 'sudo bash /usr/local/sbin/cleanup_polymetis.sh'"
+        warn "       ssh kist@192.168.1.12 'sudo bash /usr/local/sbin/start_franka_arm.sh'"
     else
-        warn "polymetis :50051 NOT reachable on NUC"
-        warn "  Manual action on NUC (one of):"
-        warn "    1) Foreground (Ctrl+C to stop, recommended for sessions):"
-        warn "         ssh kist@192.168.1.12"
-        warn "         sudo bash /usr/local/sbin/start_franka_arm.sh"
-        warn "    2) Auto-quit on session end (detached, logs to /tmp/franka_arm.log):"
-        warn "         ssh kist@192.168.1.12 'sudo -S nohup bash /usr/local/sbin/start_franka_arm.sh </dev/null >/tmp/franka_arm.log 2>&1 &'"
+        # Both down — clean state, just needs operator to start.
+        warn "polymetis :50051 NOT reachable on NUC (clean state)"
+        warn "  Manual action on NUC:"
+        warn "    ssh kist@192.168.1.12"
+        warn "    sudo bash /usr/local/sbin/start_franka_arm.sh"
         warn "  Don't forget Franka Desk: unlock joints + FCI Activate."
     fi
 fi
