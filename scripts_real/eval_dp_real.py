@@ -152,7 +152,12 @@ MAX_POS_STEP_PER_DT_M = 0.300   # 300mm/100ms — accept training-distribution f
 # largest consecutive position step exceeds this is treated as untrustworthy and
 # the arm holds for that cycle. 0.10m is ~2.3x the normal max and far below the
 # 0.324m degenerate case, so it drops garbage without touching real motion.
-DEGENERATE_INTRA_STEP_M = 0.10
+DEGENERATE_INTRA_STEP_M = float(os.environ.get('DEGENERATE_INTRA_STEP_M', 0.10))
+# UNet chunks are smooth (<=~45mm/step) so 0.10 cleanly isolates OOD garbage.
+# DiT FP/quant output is intrinsically noisier (mean ~50-80mm, max ~120-230mm
+# per step) yet in-distribution and workspace-bounded, so 0.10 false-holds every
+# DiT chunk. Raise it for DiT (run_eval_dit.sh sets 0.30); the per-step
+# MAX_POS_STEP_PER_DT_M + workspace check remain the real safety net.
 
 
 # =========================================================================
