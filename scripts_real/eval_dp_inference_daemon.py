@@ -200,8 +200,14 @@ def build_quant_model(policy, quant_ckpt, qtype, n_bit, calib_data, num_steps, d
                    '(required with --quant_ckpt).')
 @click.option('--qalora_num_steps', default=100, type=int,
               help='num_steps for QALoRA/TaDA models (ignored for naiveq).')
+@click.option('--collect_calib', is_flag=True, default=False,
+              help='Enable the conditional_sample appendInput hook so quant '
+                   'calibration inputs accumulate (set by run_eval_dp_2.sh). '
+                   'OFF by default so plain deploy does not accumulate.')
 def main(ckpt, port, device, num_inference_steps, use_ema, clip_sample_mode,
-         quant_ckpt, qtype, n_bit, calib_data, qalora_num_steps):
+         quant_ckpt, qtype, n_bit, calib_data, qalora_num_steps, collect_calib):
+    globalvar.set_enabled(collect_calib)
+    print(f"[daemon] calib-input collection {'ENABLED' if collect_calib else 'off'}")
     print(f"[daemon] loading {ckpt}")
     payload = torch.load(ckpt, pickle_module=dill, map_location='cpu', weights_only=False)
     cfg = payload['cfg']
@@ -279,6 +285,11 @@ def main(ckpt, port, device, num_inference_steps, use_ema, clip_sample_mode,
     for _ in range(2):
         with torch.no_grad():
             _ = policy.predict_action(sample_obs)
+    # Drop the warm-up's zero-obs samples so calibration captures only real
+    # deploy observations (no-op when collection is off).
+    if collect_calib:
+        globalvar.resetInput()
+        print("[daemon] calib buffer reset after warm-up")
     print(f"[daemon] warmed up; listening on tcp://127.0.0.1:{port}")
 
     ctx = zmq.Context()
