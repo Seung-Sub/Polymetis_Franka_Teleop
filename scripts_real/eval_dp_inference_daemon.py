@@ -69,6 +69,106 @@ import quant.calib.dp_globalvar as globalvar
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
+# ---------------------------------------------------------------------------
+# Quantized / distilled checkpoint support (PTQ naiveq + QALoRA/TaDA).
+# Mirrors agile_diffusion/quant/eval/eval_fakeq.py::build_student_from_policy so
+# the SAME quantw{b}a{b}_naiveq.pth / qalora state_dicts deploy here unchanged.
+# All quant imports are lazy (inside build_quant_model) so the FP/agile-DP path
+# never needs the quant package.
+# ---------------------------------------------------------------------------
+import inspect as _inspect
+
+
+class _DPNoisePredWrapper(torch.nn.Module):
+    """Adapt the DP noise-pred UNet to QuantModel's (x, t, global_cond) calls."""
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+        self.sig = _inspect.signature(net.forward)
+
+    def forward(self, x, t, global_cond=None, **kwargs):
+        dev = x.device
+        t = (t.to(device=dev, dtype=torch.long) if torch.is_tensor(t)
+             else torch.as_tensor(t, device=dev, dtype=torch.long))
+        if global_cond is not None:
+            if not torch.is_tensor(global_cond):
+                global_cond = torch.as_tensor(global_cond)
+            global_cond = global_cond.to(device=dev, dtype=x.dtype)
+        if 'global_cond' in self.sig.parameters:
+            return self.net(x, t, global_cond=global_cond, **kwargs)
+        if 'cond' in self.sig.parameters:
+            return self.net(x, t, cond=global_cond, **kwargs)
+        return self.net(x, t)
+
+
+def _get_calib_samples(loader, n):
+    tr, tt, cc = [], [], []
+    for (traj, t, cond) in loader:
+        tr.append(traj); tt.append(t); cc.append(cond)
+        if len(tr) >= n:
+            break
+    return torch.cat(tr, 0)[:n], torch.cat(tt, 0)[:n], torch.cat(cc, 0)[:n]
+
+
+def _load_quant_state_dict(qnn, qckpt):
+    # key remap identical to eval_fakeq.load_state_dict_safely: policy.state_dict()
+    # nests the quant net under 'model.model....' (policy.model == qnn, qnn.model
+    # == wrapped UNet), so strip one 'model.' so it lines up with qnn's own keys.
+    new = {}
+    for k, v in qckpt.items():
+        nk = k
+        if nk.startswith('model.model.'):
+            nk = nk.replace('model.model.', 'model.', 1)
+        elif nk.startswith('net.'):
+            nk = 'model.net.' + nk[len('net.'):]
+        new[nk] = v
+    missing, unexpected = qnn.load_state_dict(new, strict=False)
+    print(f"[daemon/quant] load_state_dict: missing={len(missing)} "
+          f"unexpected={len(unexpected)}", flush=True)
+    if missing:
+        print(f"[daemon/quant]   missing[:8]={missing[:8]}", flush=True)
+    return missing, unexpected
+
+
+def build_quant_model(policy, quant_ckpt, qtype, n_bit, calib_data, num_steps, device):
+    """Replace policy.model with a quantized UNet loaded from quant_ckpt.
+
+    The init pass (need_init=True forward on calib samples) materialises the
+    quant params' tensors; the saved state dict then overwrites their values.
+    """
+    from torch.utils.data import DataLoader
+    from quant.quant_model import QuantModel, QuantModelLoRA, QuantModelLoRATaDA
+    from quant.quant_dataset import DiffusionInputDataset
+    base = _DPNoisePredWrapper(policy.model).eval().to(device)
+    wq = {'n_bits': n_bit, 'channel_wise': True,  'scale_method': 'max', 'symmetric': True}
+    aq = {'n_bits': n_bit, 'channel_wise': False, 'scale_method': 'max',
+          'leaf_param': True, 'symmetric': True}
+    if qtype == 'naiveq':
+        qnn = QuantModel(model=base, weight_quant_params=wq, act_quant_params=aq, need_init=True)
+    elif qtype == 'qalora':
+        qnn = QuantModelLoRA(model=base, weight_quant_params=wq, act_quant_params=aq, num_steps=num_steps)
+    elif qtype == 'qalora_tada':
+        qnn = QuantModelLoRATaDA(model=base, weight_quant_params=wq, act_quant_params=aq, num_steps=num_steps)
+    else:
+        raise ValueError(f"unknown qtype {qtype!r} (expected naiveq|qalora|qalora_tada)")
+    qnn.set_first_last_layer_to_8bit()
+    qnn.set_quant_state(True, True)
+    qnn = qnn.to(device).eval()
+    ds = DiffusionInputDataset(calib_data)
+    dl = DataLoader(dataset=ds, batch_size=16, shuffle=True)
+    ct, cti, cc = _get_calib_samples(dl, 4000)
+    print(f"[daemon/quant] init pass on {ct.shape[0]} calib samples ({qtype} "
+          f"w{n_bit}a{n_bit}) ...", flush=True)
+    with torch.no_grad():
+        _ = qnn(ct.to(device), cti.to(device), cc.to(device))
+    qckpt = torch.load(quant_ckpt, map_location='cpu')
+    _load_quant_state_dict(qnn, qckpt)
+    qnn.eval()
+    setattr(policy, 'model', qnn)
+    print(f"[daemon/quant] loaded {qtype} w{n_bit}a{n_bit} from {quant_ckpt}", flush=True)
+    return policy
+
+
 @click.command()
 @click.option('--ckpt', required=True, help='Path to DP workspace ckpt.')
 @click.option('--port', default=5555, type=int)
@@ -88,7 +188,20 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
                    "(force_action_range_normalize=True training), clip_sample is "
                    "kept at the training-time value. 'force_off' always sets to "
                    "False (legacy fallback). 'keep' never touches it.")
-def main(ckpt, port, device, num_inference_steps, use_ema, clip_sample_mode):
+@click.option('--quant_ckpt', default=None,
+              help='Optional quantized state_dict (quantw{b}a{b}_naiveq.pth or '
+                   'a qalora .pth). When set, --ckpt is the FP teacher and its '
+                   '.model is replaced by the quantized UNet. Omit for FP/agile-DP.')
+@click.option('--qtype', type=click.Choice(['naiveq', 'qalora', 'qalora_tada']),
+              default='naiveq', help='Quant model family for --quant_ckpt.')
+@click.option('--n_bit', default=8, type=int, help='Weight/act bit-width for --quant_ckpt.')
+@click.option('--calib_data', default=None,
+              help='DiffusionInput_calib.pth used for the quant init pass '
+                   '(required with --quant_ckpt).')
+@click.option('--qalora_num_steps', default=100, type=int,
+              help='num_steps for QALoRA/TaDA models (ignored for naiveq).')
+def main(ckpt, port, device, num_inference_steps, use_ema, clip_sample_mode,
+         quant_ckpt, qtype, n_bit, calib_data, qalora_num_steps):
     print(f"[daemon] loading {ckpt}")
     payload = torch.load(ckpt, pickle_module=dill, map_location='cpu', weights_only=False)
     cfg = payload['cfg']
@@ -139,6 +252,20 @@ def main(ckpt, port, device, num_inference_steps, use_ema, clip_sample_mode):
               f"{policy.noise_scheduler.config.clip_sample} ({reason})")
 
     print(f"[daemon] policy on {device}; horizon={cfg.horizon} n_obs_steps={cfg.n_obs_steps}")
+
+    # === Optional: swap in a quantized / distilled UNet ===
+    # --ckpt stays the FP teacher (for cfg/normalizer/scheduler); only policy.model
+    # is replaced. agile-DP FP ckpts deploy with NO --quant_ckpt (this block is
+    # skipped). The action_normalizer/clip_sample logic above is unaffected
+    # (it reads the normalizer, which the quant swap does not touch).
+    if quant_ckpt:
+        if not calib_data:
+            raise click.UsageError("--quant_ckpt requires --calib_data for the init pass")
+        policy = build_quant_model(
+            policy, quant_ckpt=quant_ckpt, qtype=qtype, n_bit=n_bit,
+            calib_data=calib_data, num_steps=qalora_num_steps, device=device)
+        policy.eval().to(device)
+        policy.num_inference_steps = num_inference_steps
 
     # warm up
     sample_obs = {
