@@ -45,7 +45,7 @@
 
 set +e
 
-NUC_HOST="${NUC_HOST:-kist@192.168.1.12}"
+NUC_HOST="${NUC_HOST:-kist@192.168.1.14}"
 NUC_PASS="${NUC_PASS:-kist}"
 SELF_PID=$$
 
@@ -111,6 +111,11 @@ PATTERNS=(
     "polymetis_franka_teleop/real_world/franka_policy_env"
     "polymetis_franka_teleop/real_world/video_recorder"
     "polymetis_franka_teleop/real_world/franka_gripper_controller"
+    # multiprocessing children spawned by mp.Process / mp.SharedMemoryManager.
+    # The parent demo dies on Ctrl+C but these can be orphaned if its
+    # cleanup path is interrupted.  Match them by their canonical -c body.
+    "from multiprocessing.spawn import spawn_main"
+    "from multiprocessing.resource_tracker import main"
     # Isaac-GR00T side (3090 abandoned but kept for completeness)
     "gr00t/eval/run_gr00t_server"
     "gr00t/eval/open_loop_eval"
@@ -126,7 +131,7 @@ kill_pattern() {
 }
 
 for pat in "${PATTERNS[@]}"; do kill_pattern "$pat" TERM; done
-sleep 2
+sleep 5
 SURVIVORS=0
 for pat in "${PATTERNS[@]}"; do
     pids=$(pgrep -f "$pat" 2>/dev/null | grep -v "^${SELF_PID}\$")
@@ -208,6 +213,23 @@ restart_if_dead art-gripper-daemon
 # Port-level health check on art_gripper :50053
 if port_alive 127.0.0.1 50053 2; then
     ok "art_gripper :50053 reachable"
+    # Daemon liveness is NOT bus liveness: art_gripper_daemon answers on :50053
+    # even when the gripper drive is unplugged/unpowered (observed 2026-06-04:
+    # ping OK but `ethercat master` => Slaves: 0, Link: DOWN). Commands then
+    # silently no-op. Check the EtherCAT bus too so preflight doesn't green-light
+    # a session with a dead gripper. Recover with bin/recover_gripper.sh.
+    ECAT_BIN="${ECAT_BIN:-/opt/etherlab/bin/ethercat}"
+    if [ -x "$ECAT_BIN" ]; then
+        ecat_slaves=$("$ECAT_BIN" master 2>/dev/null | awk -F: '/Slaves:/{gsub(/ /,"",$2);print $2;exit}')
+        ecat_slaves=${ecat_slaves:-0}
+        if [ "$ecat_slaves" -ge 1 ] && "$ECAT_BIN" master 2>/dev/null | grep -qi 'Link: *UP'; then
+            ok "art_gripper EtherCAT bus: $ecat_slaves slave(s), Link UP"
+        else
+            warn "art_gripper daemon is up but EtherCAT bus is DEAD (slaves=$ecat_slaves, Link not UP)"
+            warn "  -> gripper drive is off/unplugged. Recover before a session:"
+            warn "       bash ~/Polymetis_Franka_Teleop/bin/recover_gripper.sh"
+        fi
+    fi
 else
     warn "art_gripper :50053 NOT reachable despite systemd active -- daemon may be in init phase"
     warn "  retry once after 3 s..."
@@ -232,7 +254,7 @@ section "6. NUC polymetis arm (Franka) -- diagnostic only"
 
 if [ "$SKIP_NUC" = "1" ]; then
     note "--no-nuc passed -- skipped"
-elif ! port_alive 192.168.1.12 22 2; then
+elif ! port_alive 192.168.1.14 22 2; then
     warn "NUC SSH (port 22) NOT reachable -- check NUC power / LAN cable"
 else
     # Choose SSH prefix
@@ -243,7 +265,7 @@ else
     fi
 
     port_open=0
-    port_alive 192.168.1.12 50051 2 && port_open=1
+    port_alive 192.168.1.14 50051 2 && port_open=1
 
     # Process inventory on NUC (always check, regardless of port state).
     proc_count=$($SSH_PFX "$NUC_HOST" \
@@ -264,20 +286,20 @@ else
         warn "        AssertionError: Port unavailable; possibly another server found..."
         warn ""
         warn "  Fix: clean up NUC with the bundled helper, then relaunch:"
-        warn "       ssh kist@192.168.1.12"
+        warn "       ssh kist@192.168.1.14"
         warn "       sudo bash /usr/local/sbin/cleanup_polymetis.sh"
         warn "       sudo bash /usr/local/sbin/start_franka_arm.sh"
     elif [ "$port_open" = "0" ] && [ "$proc_count" -gt 0 ]; then
         # No port but processes alive — half-dead state.
         warn "polymetis :50051 NOT reachable but $proc_count NUC process(es) still alive"
         warn "  -> partially crashed.  Clean up first:"
-        warn "       ssh kist@192.168.1.12 'sudo bash /usr/local/sbin/cleanup_polymetis.sh'"
-        warn "       ssh kist@192.168.1.12 'sudo bash /usr/local/sbin/start_franka_arm.sh'"
+        warn "       ssh kist@192.168.1.14 'sudo bash /usr/local/sbin/cleanup_polymetis.sh'"
+        warn "       ssh kist@192.168.1.14 'sudo bash /usr/local/sbin/start_franka_arm.sh'"
     else
         # Both down — clean state, just needs operator to start.
         warn "polymetis :50051 NOT reachable on NUC (clean state)"
         warn "  Manual action on NUC:"
-        warn "    ssh kist@192.168.1.12"
+        warn "    ssh kist@192.168.1.14"
         warn "    sudo bash /usr/local/sbin/start_franka_arm.sh"
         warn "  Don't forget Franka Desk: unlock joints + FCI Activate."
     fi
@@ -336,7 +358,7 @@ fi
 section "Summary"
 
 probes=(
-    "polymetis_arm  192.168.1.12 50051"
+    "polymetis_arm  192.168.1.14 50051"
     "art_gripper    127.0.0.1    50053"
     "vive_input     127.0.0.1    12345"
 )

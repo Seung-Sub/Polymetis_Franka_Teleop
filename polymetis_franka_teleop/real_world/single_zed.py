@@ -64,6 +64,7 @@ class SingleZed(mp.Process):
             video_recorder: Optional[VideoRecorder] = None,
             receive_latency: float = 0.0,
             verbose=False,
+            open_lock=None,
     ):
         super().__init__()
 
@@ -139,6 +140,7 @@ class SingleZed(mp.Process):
         self.video_recorder = video_recorder
         self.receive_latency = receive_latency
         self.verbose = verbose
+        self.open_lock = open_lock
         self.put_start_time = None
 
         self.stop_event = mp.Event()
@@ -259,7 +261,23 @@ class SingleZed(mp.Process):
             init.camera_fps = self.capture_fps
             init.depth_mode = sl.DEPTH_MODE.NONE
             init.coordinate_units = sl.UNIT.METER
-            err = cam.open(init)
+            # Serialize sl.Camera.open() across sibling ZED workers. The ZED
+            # SDK enumerates + negotiates USB bandwidth inside open(); two
+            # cameras calling it at the same instant (MultiZed spawns the
+            # workers back-to-back, so both reach open() within milliseconds)
+            # intermittently left one camera -- on the KIST rig the wrist cam
+            # SN 11667817 -- stuck, so its ready_event never fired and
+            # start_wait() timed out (verify_*.log, 2026-05-18: repeated
+            # "[SingleZed 11667817] start_wait timed out"). Holding a shared
+            # lock ONLY around open() makes the opens sequential while still
+            # letting both cameras stream concurrently afterwards -- the
+            # multi-camera bring-up order ZED recommends. open_lock=None keeps
+            # the original concurrent behaviour (safe fallback).
+            if self.open_lock is not None:
+                with self.open_lock:
+                    err = cam.open(init)
+            else:
+                err = cam.open(init)
             # POTENTIAL_CALIBRATION_ISSUE is a *warning*, not an error in the
             # ZED SDK: the camera opens and streams just fine, the SDK is only
             # cautioning that stereo depth precision may be off (calibration
@@ -316,6 +334,33 @@ class SingleZed(mp.Process):
             _fps_window_start = t_loop
             _fps_window_iters = 0
 
+            # Burst-tolerant put. A USB hiccup makes cam.grab() drain its
+            # backlog at >capture_fps (see the moving-window FPS note above);
+            # that burst can momentarily outrun SharedMemoryRingBuffer's
+            # read-safety guard (get_time_budget=0.2s), which raises
+            # TimeoutError on a wait=False put. An UNCAUGHT TimeoutError here
+            # killed the whole SingleZed worker -> the ring buffer froze and
+            # every downstream consumer (eval latency-matched obs, collection
+            # recording) read the same stale frame forever, which on the eval
+            # side anchored action_timestamps to a frozen t_obs and made every
+            # cycle go "Over budget -> last action only" (jerky deploy). Drop
+            # the burst frame instead: burst frames are redundant by
+            # definition, so the next non-bursting grab repopulates the buffer
+            # with no visible gap, and the worker stays alive.
+            _put_drop = {'n': 0, 't': 0.0}
+            def _safe_put(buf, payload):
+                try:
+                    buf.put(payload, wait=False)
+                except TimeoutError:
+                    _put_drop['n'] += 1
+                    _now = time.time()
+                    if _now - _put_drop['t'] > 5.0:
+                        _put_drop['t'] = _now
+                        print(f'[SingleZed {self.serial_number}] WARN: ring-buffer '
+                              f'put outran read-safety guard during a capture '
+                              f'burst -- dropped {_put_drop["n"]} frame(s) so far '
+                              f'(stream kept alive).', flush=True)
+
             while not self.stop_event.is_set():
                 if cam.grab(rt) != sl.ERROR_CODE.SUCCESS:
                     continue
@@ -351,19 +396,19 @@ class SingleZed(mp.Process):
                     for step_idx in global_idxs:
                         put_data['step_idx'] = step_idx
                         put_data['timestamp'] = calibrated_time
-                        self.ring_buffer.put(put_data, wait=False)
+                        _safe_put(self.ring_buffer, put_data)
                 else:
                     step_idx = int((receive_time - put_start_time) * self.put_fps)
                     put_data['step_idx'] = step_idx
                     put_data['timestamp'] = calibrated_time
-                    self.ring_buffer.put(put_data, wait=False)
+                    _safe_put(self.ring_buffer, put_data)
 
                 if iter_idx == 0:
                     self.ready_event.set()
 
                 vis_data = put_data if self.vis_transform == self.transform \
                     else (data if self.vis_transform is None else self.vis_transform(dict(data)))
-                self.vis_ring_buffer.put(vis_data, wait=False)
+                _safe_put(self.vis_ring_buffer, vis_data)
 
                 rec_data = put_data if self.recording_transform == self.transform \
                     else (data if self.recording_transform is None else self.recording_transform(dict(data)))

@@ -8,6 +8,7 @@ from typing import List, Optional, Union, Dict, Callable
 import numbers
 import time
 import pathlib
+import multiprocessing as mp
 from multiprocessing.managers import SharedMemoryManager
 import numpy as np
 
@@ -56,6 +57,13 @@ class MultiZed:
         recording_transform = _repeat_to_list(recording_transform, n, Callable)
         video_recorder = _repeat_to_list(video_recorder, n, VideoRecorder)
 
+        # One lock shared by every SingleZed worker so their sl.Camera.open()
+        # calls run one-at-a-time. Prevents the concurrent-open USB
+        # enumeration race that intermittently hung the wrist ZED at startup
+        # (see SingleZed.run). mp.Lock is shared with the spawned children the
+        # same way self.ready_event/stop_event already are (inheritance).
+        open_lock = mp.Lock()
+
         cameras = {}
         for i, sn in enumerate(serial_numbers):
             cameras[int(sn)] = SingleZed(
@@ -73,7 +81,13 @@ class MultiZed:
                 video_recorder=video_recorder[i],
                 receive_latency=receive_latency,
                 verbose=verbose,
+                open_lock=open_lock,
             )
+        # Preserve the user-supplied --camera_serials list for downstream
+        # invariant checks (e.g., franka_vive_env._write_camera_calib asserts
+        # list(cams.keys()) == self.serial_numbers, catching any future
+        # sorted()/reordering regression).
+        self.serial_numbers = [int(s) for s in serial_numbers]
         self.cameras = cameras
         self.shm_manager = shm_manager
 
